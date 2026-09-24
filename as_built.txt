@@ -1,0 +1,88 @@
+================================================================================
+AS-BUILT — Alternate Lead Finder
+Last updated: 2026-09-24
+================================================================================
+
+OVERVIEW
+Weekly automation that, for each closed/unresponsive lead in
+closed_sequence_threads, finds a DIFFERENT contact at the same company (via
+Hunter.io), dedups against ActiveCampaign, records it in alternate_leads,
+appends it to the sales Google Sheet, and emails Liv a preview.
+
+SUPABASE PROJECTS (org zakkhdjcwkgxjppsjnyi)
+- aivitcomiywiysrfwqxt (MAGTestProject, ap-northeast-1) — all business tables,
+  the edge function, and its pg_cron job live here.
+- uwsncuowtzydylfabikj (n8n-production, ap-southeast-2) — n8n's own backend DB;
+  the pg_cron job that fires the n8n webhook lives here.
+
+EDGE FUNCTION
+- supabase/functions/alternate-lead-finder/index.ts — Deno + @supabase/supabase-js
+  (service role), verify_jwt=false. Deployed to project aivitcomiywiysrfwqxt.
+  URL: https://aivitcomiywiysrfwqxt.supabase.co/functions/v1/alternate-lead-finder
+  Flow: query unprocessed closed_sequence_threads (email not null) -> Hunter.io
+  domain-search per company (limit=10, the Free-plan max) -> prioritise target POC
+  roles (<=5) else 1 fallback -> exclude emails already in AC (cached table, or
+  live AC API when the table is empty) -> insert into alternate_leads (lead_type
+  'soc med' for follow_up_sequence_threads source, else 'cold'; carry speaker/event
+  for soc med) -> mark source rows is_processed=true -> append new leads to the
+  sales sheet tab 'alternate_leads_found' (dynamic column mapping) and set
+  is_added_to_sheet=true -> email a dynamic HTML preview to Liv.
+  Runs work in EdgeRuntime.waitUntil, returns 202.
+  Debug query params: ?sync=1 (await + return summary), ?limit=N (cap batch),
+  ?inspect=1 (check Sheets/Gmail/AC access, no send), ?append=1 (append+email only),
+  ?probe=<domain> (raw Hunter check), ?to=<email> (override email recipient).
+  Requires (edge-function secrets, set in Supabase — NOT in the repo):
+  SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY (auto-injected), HUNTER_IO_API_KEY,
+  GOOGLE_SERVICE_ACCOUNT_JSON, AC_API_URL, AC_API_TOKEN. Optional overrides:
+  NOTIFY_TO (default liv@myadventuregroup.com.au), NOTIFY_FROM (default
+  julienne@myadventuregroup.com.au), SALES_SHEET_ID, ALT_LEADS_TAB.
+
+EXTERNAL INTEGRATIONS
+- Hunter.io (api.hunter.io/v2/domain-search) — REST, key in Supabase secret
+  HUNTER_IO_API_KEY and in GCP Secret Manager (hunter-io-api-key). FREE PLAN:
+  ~50 domain searches/month, limit param must be <=10.
+- Google Sheets + Gmail — Sheets/Gmail REST APIs via service account
+  insta-drive-uploader@claudegwscli-502400.iam.gserviceaccount.com (client id
+  112006793372164249856), key in Supabase secret GOOGLE_SERVICE_ACCOUNT_JSON.
+  Setup: the sales sheet is shared with the SA as Editor; the SA client id has
+  Workspace domain-wide delegation for scope .../auth/gmail.send (sends as
+  NOTIFY_FROM). Sheet: docs.google.com/spreadsheets/d/
+  1svksxHmNBUx9Z20t2kbtHAT1fThcfdCmz5dEp936L7I (tab 'alternate_leads_found').
+- ActiveCampaign — REST (api/3/contacts), AC_API_URL + AC_API_TOKEN Supabase
+  secrets. Used only as a live fallback when the activecampaign_contacts table
+  is empty.
+- n8n "Closed Threads Processing" (Cloud Run webhook 8fe86e56-7c2f-45cd-9658-
+  ab653f9f2559) — populates closed_sequence_threads weekly (built separately).
+
+DATA STORES (project aivitcomiywiysrfwqxt)
+- alternate_leads — master record of alternate leads found. Columns = union of
+  closed_sequence_threads + follow_up_sequence_threads (deduped) plus lead_type,
+  org, event, poc_lastname, poc_role, is_added_to_sheet. Own bigserial PK, RLS on,
+  indexes on lower(email) and is_added_to_sheet.
+- closed_sequence_threads — input; source_table in {cold_leads_follow_up_sequence_
+  threads, follow_up_sequence_threads, bounced}. Rows flagged is_processed=true
+  once handled.
+- activecampaign_contacts (~15k, refreshed daily), follow_up_sequence_threads,
+  cold_leads_follow_up_sequence_threads, ai_scraped_soc_med_leads — read for dedup
+  and to carry speaker/event/context.
+
+AUTOMATIONS / ROUTINES (pg_cron; UTC-only, Sun UTC = Mon PHT)
+- alternate-lead-finder-weekly (project aivitcomiywiysrfwqxt) — '55 22 * * 0' =
+  Mon 6:55 AM PHT. net.http_post to the edge function URL with the anon key.
+- n8n-closed-threads-processing (project uwsncuowtzydylfabikj) — '0 22 * * 0' =
+  Mon 6:00 AM PHT. net.http_get to the n8n webhook. Also recorded in the
+  n8n_google_cloud_run_deployment/schedule_webhooks.sql repo.
+
+LOCAL FILES
+- manual_invoke.txt — cmd.exe curl commands to invoke the function on demand
+  (contains the public anon key only).
+- alternate-lead-finder.html — iMAG-themed end-user guide for the automation.
+- initial_prompt.txt — the original brief.
+- hunter_io_api_key.txt, supabase_access_token.txt — LIVE SECRETS, gitignored
+  (never committed). Also stored in GCP Secret Manager.
+
+GCP
+- Project claudegwscli-502400. Secret Manager: hunter-io-api-key and
+  supabase-access-token (added this session), each granted secretAccessor to the
+  compute SA 659687081407-compute@developer.gserviceaccount.com.
+================================================================================

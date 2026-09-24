@@ -1,0 +1,50 @@
+========================================================================
+ Manually invoke the "alternate-lead-finder" Supabase edge function
+ (Windows Command Prompt / cmd.exe — curl is built into Windows 10/11)
+========================================================================
+
+Just paste ONE of the commands below into cmd.exe and press Enter.
+The function returns immediately with {"status":"started"} (HTTP 202) and
+does the real work in the background (finds alternate leads, appends to the
+sheet, emails Liv). Give it a minute or two to finish.
+
+------------------------------------------------------------------------
+ 1) NORMAL RUN  (processes ALL unprocessed closed leads) -- this is the
+    same thing the Monday 6:55 AM PHT schedule runs.
+------------------------------------------------------------------------
+curl -X POST "https://aivitcomiywiysrfwqxt.supabase.co/functions/v1/alternate-lead-finder" -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFpdml0Y29taXl3aXlzcmZ3cXh0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzUzODQ3OTYsImV4cCI6MjA5MDk2MDc5Nn0.4fpVwIpuYZwtEWKQA2X8pG2Ok-ryocZNA7k3ScDLbUE" -H "Content-Type: application/json" -d "{}"
+
+
+========================================================================
+ OPTIONAL VARIANTS (add query params to the URL)
+========================================================================
+
+------------------------------------------------------------------------
+ 2) TEST A SMALL BATCH  (only the first 2 leads -- saves Hunter credits).
+    ?sync=1 waits and prints the result instead of returning right away.
+------------------------------------------------------------------------
+curl -X POST "https://aivitcomiywiysrfwqxt.supabase.co/functions/v1/alternate-lead-finder?limit=2&sync=1" -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFpdml0Y29taXl3aXlzcmZ3cXh0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzUzODQ3OTYsImV4cCI6MjA5MDk2MDc5Nn0.4fpVwIpuYZwtEWKQA2X8pG2Ok-ryocZNA7k3ScDLbUE" -H "Content-Type: application/json" -d "{}"
+
+------------------------------------------------------------------------
+ 3) APPEND + EMAIL ONLY  (no Hunter calls). Pushes any leads still queued
+    (is_added_to_sheet = false) to the sheet and emails Liv.
+    Add &to=you@... to send the test email to yourself instead of Liv.
+------------------------------------------------------------------------
+curl -X POST "https://aivitcomiywiysrfwqxt.supabase.co/functions/v1/alternate-lead-finder?append=1" -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFpdml0Y29taXl3aXlzcmZ3cXh0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzUzODQ3OTYsImV4cCI6MjA5MDk2MDc5Nn0.4fpVwIpuYZwtEWKQA2X8pG2Ok-ryocZNA7k3ScDLbUE" -H "Content-Type: application/json" -d "{}"
+
+------------------------------------------------------------------------
+ 4) HEALTH CHECK  (does NOT process anything): confirms Sheets, Gmail and
+    ActiveCampaign access are all working.
+------------------------------------------------------------------------
+curl -X POST "https://aivitcomiywiysrfwqxt.supabase.co/functions/v1/alternate-lead-finder?inspect=1" -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFpdml0Y29taXl3aXlzcmZ3cXh0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzUzODQ3OTYsImV4cCI6MjA5MDk2MDc5Nn0.4fpVwIpuYZwtEWKQA2X8pG2Ok-ryocZNA7k3ScDLbUE" -H "Content-Type: application/json" -d "{}"
+
+
+========================================================================
+ NOTES
+========================================================================
+- The long "Bearer ..." value is the project's public anon key (safe to keep
+  here). It's only needed so the request passes the Supabase gateway.
+- Normal runs return {"status":"started"} instantly -- that is success, not
+  an error. Check results in the alternate_leads table / the sheet / Liv's inbox.
+- Reminder: Hunter.io is on the Free plan (50 domain searches/month), so a full
+  run can only enrich ~50 orgs per month.

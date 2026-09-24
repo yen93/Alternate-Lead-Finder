@@ -1,0 +1,30 @@
+**n8n_workflow: ** https://n8n-659687081407.australia-southeast1.run.app/workflow/MveMnP6j7IIQ6UYM
+**supabase_table: ** closed_sequence_threads
+**webhook_txt: ** "C:\Users\Cloverly\claude_code\n8n_google_cloud_run_deployment\240926 additional webhook.txt"
+**hunter_io_txt: ** "C:\Users\Cloverly\claude_code\Alternate Lead Finder\hunter_io_api_key.txt"
+**initial_query: ** 
+select * from closed_sequence_threads
+where email is not null
+and (
+    is_processed is null
+    or is_processed = false
+)
+**target_poc_roles: ** HR, EA, Events Manager, Conference Manager, Marketing Manager, Communication Manager, Learning & Development Manager, People & Culture Manager
+**ac_contacts_checking: ** You can check activecampaign_contacts supabase table or if there is any issue with that table, you can directly check AC. sometimes activecampaign_contacts will be blank cos it goes thru a caching process once a day and it can throw an error sometimes and it will remain blank for a while. but most of the time it will be populated just fine. in case it is blank again, just directly check AC.
+**sales_sheet: ** https://docs.google.com/spreadsheets/d/1svksxHmNBUx9Z20t2kbtHAT1fThcfdCmz5dEp936L7I/edit?gid=2007936122#gid=2007936122
+
+## Do This Before Starting Main Task:
+1. Create table called 'alternate_leads'. columns should be all columns in closed_sequence_threads and follow_up_sequence_threads combined plus add these columns lead_type (text), org (text), event (text), poc_lastname, poc_role, is_added_to_sheet
+2. create pg_cron sched job for webhook_txt. it's the webhook of n8n_workflow
+3.  if it's not yet in Google Secrets Manager, add hunter_io_txt.
+
+
+## Main Task:
+- Create a supabase edge function that will run once a week @ 6:55 AM PH Time every Monday. This is an automation that will process all unresponsive leads in closed_sequence_threads and find a different lead in the same org that we can reach out to.
+
+## Main Task Steps:
+1. execute initial_query
+2. for each row, use hunter_io_txt and look for a different lead in the same company/org. Make sure to prioritize finding leads under target_poc_roles. it's ok to find up to 5 leads each org as long as they fall under target_poc_roles. But if we cannot find anyone with any of those roles, just find anyone with any role in that company (max 1 lead for this fallback). Make sure the email address is not yet saved in our AC Contacts. Read ac_contacts_checking. 
+3. insert the new leads found into alternate_leads table. lead_type should either be 'soc med' or 'cold'. if soc med, pls fillout the speaker and event columns. for both lead types, fillout the rest of the columns that can be filled out only.
+4. for each processed row in closed_sequence_threads table, set is_processed = true
+5. append new leads in alternate_leads table where is_added_to_sheet is null or false into alternate_leads_found sheet in the sales_sheet. after every row, update alternate_leads table and set is_added_to_sheet to true.

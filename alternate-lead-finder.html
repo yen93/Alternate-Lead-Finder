@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Alternate Lead Finder</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Lato:wght@300;400;700&display=swap" rel="stylesheet">
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: 'Lato', Arial, sans-serif; background: #ffffff; }
+  .col { max-width: 760px; margin: 0 auto; padding: 32px 20px; }
+  .header-band {
+    background: linear-gradient(rgba(0,0,0,0.4), rgba(0,0,0,0.4)), url(https://ssl.gstatic.com/atari/images/simple-header-blended-small.png) center/cover, #37474F;
+    min-height: 320px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    padding: 20px;
+  }
+  .header-band h1 {
+    color: #ffffff;
+    font-family: 'Lato', sans-serif;
+    font-weight: 300;
+    font-size: 44px;
+    letter-spacing: 0.5px;
+    margin: 0 0 12px 0;
+    line-height: 1.2;
+  }
+  .header-band .subtitle {
+    color: #ffffff;
+    font-family: 'Lato', sans-serif;
+    font-weight: 300;
+    font-size: 18px;
+    margin: 0;
+    opacity: 0.9;
+  }
+  .intro-band { background: #323232; }
+  .intro-band p {
+    color: #ffffff;
+    font-family: 'Lato', sans-serif;
+    font-size: 16px;
+    line-height: 1.6;
+    margin: 0;
+  }
+  .header-strip { background: #F2F2F2; }
+  .header-strip .col { padding: 32px 20px; }
+  .header-strip h2 {
+    color: #37474F;
+    font-family: 'Lato', sans-serif;
+    font-weight: 400;
+    font-size: 26px;
+    margin: 0;
+  }
+  .content-band { background: #ffffff; }
+  .content-band h3 {
+    color: #37474F;
+    font-family: 'Lato', sans-serif;
+    font-weight: 700;
+    font-size: 19px;
+    margin: 24px 0 8px 0;
+  }
+  .content-band h3:first-child { margin-top: 0; }
+  .content-band p {
+    color: #212121;
+    font-family: 'Lato', sans-serif;
+    font-size: 16px;
+    line-height: 1.6;
+    margin: 0 0 16px 0;
+  }
+  .content-band ul, .content-band ol {
+    color: #212121;
+    font-family: 'Lato', sans-serif;
+    font-size: 16px;
+    line-height: 1.6;
+    padding-left: 24px;
+    margin: 0 0 16px 0;
+  }
+  .content-band li { margin-bottom: 10px; }
+  .content-band a { color: #37474F; text-decoration: underline; }
+  .content-band code {
+    background: #F2F2F2;
+    padding: 2px 6px;
+    border-radius: 3px;
+    font-size: 14px;
+  }
+  .placeholder-img {
+    display: block;
+    width: 100%;
+    max-width: 100%;
+    height: auto;
+    margin: 8px 0 4px 0;
+    border: 1px solid #e0e0e0;
+  }
+  .placeholder-caption {
+    color: #757575;
+    font-family: 'Lato', sans-serif;
+    font-size: 13px;
+    font-style: italic;
+    margin: 0 0 16px 0;
+  }
+  .closing-band p {
+    color: #212121;
+    font-family: 'Lato', sans-serif;
+    font-size: 15px;
+    line-height: 1.6;
+    margin: 0 0 4px 0;
+  }
+</style>
+</head>
+<body>
+
+<!-- HEADER BANNER (top of page only) -->
+<div class="header-band">
+  <div>
+    <h1>Alternate Lead Finder</h1>
+    <p class="subtitle">Turning closed, unresponsive leads into fresh people to contact</p>
+  </div>
+</div>
+
+<!-- TOP INTRO DARK BAND -->
+<div class="intro-band">
+  <div class="col">
+    <p>The Alternate Lead Finder is a weekly automation. When an outreach sequence goes cold and the lead stops responding, it looks up a <em>different</em> contact at the same company — ideally a decision-maker in a role we care about — so sales has someone new to approach instead of hitting a dead end. Every new lead it finds is recorded, added to the sales sheet, and summarised in an email to Liv for review.</p>
+  </div>
+</div>
+
+<!-- SECTIONS -->
+<div class="header-strip">
+  <div class="col"><h2>What it does</h2></div>
+</div>
+<div class="content-band">
+  <div class="col">
+    <p>Each week the automation takes the leads whose email sequences have closed without a reply and, for every one, tries to find another person at the same organisation worth contacting.</p>
+    <ul>
+      <li>Reads the unresponsive (closed) leads that are waiting to be processed.</li>
+      <li>Uses Hunter.io to find other people at the same company (matched by email domain).</li>
+      <li>Prioritises the roles we most want to reach; falls back to any contact if none of those roles are available.</li>
+      <li>Skips anyone whose email is already one of our ActiveCampaign contacts, so we don't double up.</li>
+      <li>Saves each new lead, adds it to the sales sheet, and emails Liv a preview.</li>
+    </ul>
+  </div>
+</div>
+
+<div class="header-strip">
+  <div class="col"><h2>When it runs</h2></div>
+</div>
+<div class="content-band">
+  <div class="col">
+    <p>Two scheduled steps run every Monday, 55 minutes apart (Philippine time):</p>
+    <ul>
+      <li><strong>6:00 AM — Closed Threads Processing.</strong> An n8n workflow gathers the week's newly closed / unresponsive threads and lists them ready to be worked on.</li>
+      <li><strong>6:55 AM — Alternate Lead Finder.</strong> This automation processes that list, finds the alternate contacts, and files the results.</li>
+    </ul>
+    <p>You do not need to start either one by hand — but you can run the finder on demand at any time (see "Running it manually" below).</p>
+  </div>
+</div>
+
+<div class="header-strip">
+  <div class="col"><h2>Which contacts it looks for</h2></div>
+</div>
+<div class="content-band">
+  <div class="col">
+    <h3>Priority roles</h3>
+    <p>It prioritises finding people in these roles, and will record up to five of them per company:</p>
+    <ul>
+      <li>HR</li>
+      <li>Executive Assistant (EA)</li>
+      <li>Events Manager</li>
+      <li>Conference Manager</li>
+      <li>Marketing Manager</li>
+      <li>Communications Manager</li>
+      <li>Learning &amp; Development Manager</li>
+      <li>People &amp; Culture Manager</li>
+    </ul>
+    <h3>Fallback</h3>
+    <p>If nobody at the company matches those roles, it records just one contact of any role, so the company still gets a follow-up option rather than being skipped entirely.</p>
+    <h3>Lead type</h3>
+    <p>Each new lead is tagged as either <strong>soc med</strong> or <strong>cold</strong>, based on which sequence the original unresponsive lead came from. For soc-med leads, the original speaker and event are carried across so the context isn't lost.</p>
+  </div>
+</div>
+
+<div class="header-strip">
+  <div class="col"><h2>Where the results go</h2></div>
+</div>
+<div class="content-band">
+  <div class="col">
+    <p>Every new lead lands in three places:</p>
+    <ul>
+      <li><strong>The <code>alternate_leads</code> table</strong> — the master record of every alternate lead found, with the company, contact name, role, email, lead type, and the original thread it came from.</li>
+      <li><strong>The sales sheet</strong> — new leads are appended to the <code>alternate_leads_found</code> tab of the sales spreadsheet, ready for the team to action. <a href="https://docs.google.com/spreadsheets/d/1svksxHmNBUx9Z20t2kbtHAT1fThcfdCmz5dEp936L7I/edit">Open the sales sheet</a>.</li>
+      <li><strong>An email to Liv</strong> — after new leads are added, Liv receives a summary email with a preview table of the leads and a link to the sheet for review.</li>
+    </ul>
+  </div>
+</div>
+
+<div class="header-strip">
+  <div class="col"><h2>How duplicates are avoided</h2></div>
+</div>
+<div class="content-band">
+  <div class="col">
+    <p>Before saving any contact, the automation checks it isn't someone we already know:</p>
+    <ul>
+      <li>It first checks against our cached list of ActiveCampaign contacts.</li>
+      <li>If that cached list happens to be empty (it refreshes once a day and can briefly be blank), it checks ActiveCampaign directly instead, so the safety net is never lost.</li>
+      <li>It also skips the original unresponsive contact and anything it has already recorded, so the same person is never added twice.</li>
+    </ul>
+  </div>
+</div>
+
+<div class="header-strip">
+  <div class="col"><h2>Running it manually</h2></div>
+</div>
+<div class="content-band">
+  <div class="col">
+    <p>You can trigger the finder yourself without waiting for Monday. A file named <code>manual_invoke.txt</code> sits in the project folder with ready-to-paste commands for Windows Command Prompt.</p>
+    <ul>
+      <li><strong>Normal run</strong> — processes all outstanding closed leads, exactly like the Monday schedule.</li>
+      <li><strong>Small test batch</strong> — processes only the first couple of leads, to check things are working without using up much of the monthly Hunter.io allowance.</li>
+      <li><strong>Append + email only</strong> — pushes any leads still waiting into the sheet and emails the preview, without doing any new lookups.</li>
+      <li><strong>Health check</strong> — confirms the sheet, email, and ActiveCampaign connections are all working, without processing anything.</li>
+    </ul>
+    <p>A normal run replies instantly with a "started" message and then keeps working in the background for a minute or two — that "started" reply means it launched successfully, not that anything went wrong. Check the results in the <code>alternate_leads</code> table, the sales sheet, or Liv's inbox.</p>
+  </div>
+</div>
+
+<div class="header-strip">
+  <div class="col"><h2>Good to know</h2></div>
+</div>
+<div class="content-band">
+  <div class="col">
+    <ul>
+      <li><strong>Hunter.io allowance.</strong> The lookup service is currently on the free plan, which allows about 50 company searches per month. A single run can only enrich around 50 companies, so clearing a large backlog in one go needs a paid Hunter.io plan.</li>
+      <li><strong>Nothing is wasted on errors.</strong> If a lookup fails or the monthly allowance runs out, that lead is simply left for next time rather than being marked done — so it will be retried, not lost.</li>
+      <li><strong>The sheet tab is set up automatically.</strong> The first time it runs, it creates the column headings on the <code>alternate_leads_found</code> tab if they aren't there yet.</li>
+    </ul>
+  </div>
+</div>
+
+<!-- FIXED SECTIONS -->
+<section id="h.68f0b8918457bce8_82" style="background:#ffffff;padding:8px 20px;"><div style="max-width:760px;margin:0 auto;"><hr style="border:none;border-top:1px solid #d9d9d9;margin:0;"></div></section>
+<section id="h.5a0263770fa94d5d_3" style="background:#ffffff;padding:24px 20px;"><div style="max-width:760px;margin:0 auto;"><a href="#" style="display:inline-block;font-family:'Lato',sans-serif;font-size:15px;font-weight:400;color:#ffffff;background:#37474F;padding:12px 28px;border-radius:4px;text-decoration:none;letter-spacing:0.3px;">Button label</a></div></section>
+
+<!-- CLOSING BAND -->
+<div class="closing-band">
+  <div class="col">
+    <p>Updated by: Julienne</p>
+    <p>Last Update: 24 September 2026</p>
+  </div>
+</div>
+
+</body>
+</html>

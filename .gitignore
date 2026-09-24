@@ -1,0 +1,22 @@
+# --- Secrets / credentials (NEVER commit) ---
+hunter_io_api_key.txt
+supabase_access_token.txt
+*.env
+.env
+*.pem
+*.key
+*service_account*.json
+*service-account*.json
+*credentials*.json
+*client_secret*.json
+
+# --- Dependencies / build ---
+node_modules/
+dist/
+build/
+.supabase/
+
+# --- OS / editor cruft ---
+.DS_Store
+Thumbs.db
+*.log
