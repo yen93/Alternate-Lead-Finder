@@ -19,28 +19,51 @@ EDGE FUNCTION
 - supabase/functions/alternate-lead-finder/index.ts — Deno + @supabase/supabase-js
   (service role), verify_jwt=false. Deployed to project aivitcomiywiysrfwqxt.
   URL: https://aivitcomiywiysrfwqxt.supabase.co/functions/v1/alternate-lead-finder
-  Flow: query unprocessed closed_sequence_threads (email not null) -> Hunter.io
+  Flow: query unprocessed closed_sequence_threads (email not null; capped at 20 rows
+  per run by default, ?limit=N overrides) -> Hunter.io
   domain-search per company (limit=10, the Free-plan max) -> prioritise target POC
   roles (<=5) else 1 fallback -> exclude emails already in AC (cached table, or
   live AC API when the table is empty) -> insert into alternate_leads (lead_type
   'soc med' for follow_up_sequence_threads source, else 'cold'; carry speaker/event
-  for soc med) -> mark source rows is_processed=true -> append new leads to the
-  sales sheet tab 'alternate_leads_found' (dynamic column mapping) and set
-  is_added_to_sheet=true -> email a dynamic HTML preview to Liv.
+  for soc med) -> mark a source row is_processed=true ONLY when >=1 alternate lead
+  (with an email) was actually inserted for it (Hunter AND Apify alike; empty/errored/
+  all-deduped rows stay unprocessed and retry) -> append new leads to the sales sheet
+  tab 'alternate_leads_found' (dynamic column mapping) and set is_added_to_sheet=true
+  -> email a dynamic HTML preview to Liv.
   Runs work in EdgeRuntime.waitUntil, returns 202.
+  APIFY FALLBACK: when Hunter's monthly credits are exhausted (HTTP 429, details
+  "...limit for the number of searches per billing period...") the run switches
+  reactively to the Apify actor scrapersdelight~decision-maker-email-finder (sticky
+  for the rest of the run), which scrapes each company's own site + LinkedIn and
+  returns name/title/best-guess email/pattern/confidence/MX; records are mapped into
+  the Hunter shape so the rest of the pipeline is unchanged. Chosen because US-DB
+  actors (scalelist, dev00) returned 0 for .com.au domains. Per-run cap
+  APIFY_MAX_DOMAINS (default 80).
   Debug query params: ?sync=1 (await + return summary), ?limit=N (cap batch),
   ?inspect=1 (check Sheets/Gmail/AC access, no send), ?append=1 (append+email only),
-  ?probe=<domain> (raw Hunter check), ?to=<email> (override email recipient).
+  ?probe=<domain> (raw Hunter check), ?aprobe=<domain> (raw Apify check),
+  ?provider=apify (force Apify, skip Hunter), ?fixorg=1 (sync sheet Org column to DB
+  by email), ?to=<email> (override email recipient; honoured by ?sync runs too).
+  org is never left null on an alternate lead: when Hunter/Apify return no org, the
+  ORIGINAL lead's org is carried over (looked up by original email across
+  ai_verified_cold_leads/manually_found_cold_leads for cold, and
+  ai_scraped_soc_med_leads/manually_found_leads for soc med).
   Requires (edge-function secrets, set in Supabase — NOT in the repo):
   SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY (auto-injected), HUNTER_IO_API_KEY,
-  GOOGLE_SERVICE_ACCOUNT_JSON, AC_API_URL, AC_API_TOKEN. Optional overrides:
-  NOTIFY_TO (default liv@myadventuregroup.com.au), NOTIFY_FROM (default
-  julienne@myadventuregroup.com.au), SALES_SHEET_ID, ALT_LEADS_TAB.
+  APIFY_API_TOKEN, GOOGLE_SERVICE_ACCOUNT_JSON, AC_API_URL, AC_API_TOKEN. Optional
+  overrides: NOTIFY_TO (default liv@myadventuregroup.com.au), NOTIFY_FROM (default
+  julienne@myadventuregroup.com.au), SALES_SHEET_ID, ALT_LEADS_TAB, APIFY_ACTOR,
+  APIFY_LIMIT, APIFY_MAX_DOMAINS.
 
 EXTERNAL INTEGRATIONS
 - Hunter.io (api.hunter.io/v2/domain-search) — REST, key in Supabase secret
   HUNTER_IO_API_KEY and in GCP Secret Manager (hunter-io-api-key). FREE PLAN:
-  ~50 domain searches/month, limit param must be <=10.
+  ~50 domain searches/month, limit param must be <=10. Primary provider.
+- Apify (api.apify.com run-sync-get-dataset-items) — REST, token in Supabase secret
+  APIFY_API_TOKEN and GCP Secret Manager (apify-api-token). Reactive fallback used
+  only when Hunter is out of credits. Actor scrapersdelight~decision-maker-email-finder
+  (Starter plan, pay-per-event); scrapes company site + LinkedIn, covers AU. Verified
+  live: infrabuild.com.au -> "Tracey Sen, Head of Communication APAC".
 - Google Sheets + Gmail — Sheets/Gmail REST APIs via service account
   insta-drive-uploader@claudegwscli-502400.iam.gserviceaccount.com (client id
   112006793372164249856), key in Supabase secret GOOGLE_SERVICE_ACCOUNT_JSON.
@@ -78,11 +101,13 @@ LOCAL FILES
   (contains the public anon key only).
 - alternate-lead-finder.html — iMAG-themed end-user guide for the automation.
 - initial_prompt.txt — the original brief.
-- hunter_io_api_key.txt, supabase_access_token.txt — LIVE SECRETS, gitignored
-  (never committed). Also stored in GCP Secret Manager.
+- hunter_io_api_key.txt, supabase_access_token.txt, apify_api_token.txt — LIVE
+  SECRETS, gitignored (never committed). Also stored in GCP Secret Manager.
+  (lusha_api_key.txt is gitignored too but Lusha was dropped — unused/unstored.)
 
 GCP
-- Project claudegwscli-502400. Secret Manager: hunter-io-api-key and
-  supabase-access-token (added this session), each granted secretAccessor to the
-  compute SA 659687081407-compute@developer.gserviceaccount.com.
+- Project claudegwscli-502400. Secret Manager: hunter-io-api-key,
+  supabase-access-token, and apify-api-token, each granted
+  roles/secretmanager.secretAccessor to the compute SA
+  659687081407-compute@developer.gserviceaccount.com.
 ================================================================================

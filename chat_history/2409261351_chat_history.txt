@@ -1,0 +1,181 @@
+================================================================================
+CHAT HISTORY EXPORT — 2026-09-24
+Session: Added an Apify fallback to the Alternate Lead Finder edge function for when
+Hunter.io Free-plan credits are exhausted. Evaluated Lusha (dropped) then Apify;
+found the right AU-capable actor after two duds; made the reactive Hunter->Apify
+switch; enforced "mark a source row processed ONLY when a real lead is inserted";
+guaranteed alternate_leads.org is never null (carry over the original lead's org);
+capped each run to 20 rows; cleaned up mis-processed rows and a null-org row + the
+sheet; and created a new global "save-chat-history" skill.
+================================================================================
+
+NOTE ON REDACTIONS: No live secret VALUES were exposed this session. The Hunter,
+Apify, Lusha and Supabase-management keys were read from their local files via
+`tr` and passed through shell variables; only their byte-lengths/prefixes were ever
+printed. The project's public Supabase anon key (a publishable JWT) was used in
+curl invocations and is shown here as [REDACTED_SUPABASE_ANON_KEY] for cleanliness.
+The secret source files (hunter_io_api_key.txt, supabase_access_token.txt,
+apify_api_token.txt, lusha_api_key.txt) are gitignored and never committed.
+
+--------------------------------------------------------------------------------
+USER:
+Hunter.io Free creds are used up. Update the edge function so that if creds drop to
+zero we use Lusha as a fallback. Provided lusha_api_key.txt and asked to save it in
+Google Secret Manager if not already there.
+
+--------------------------------------------------------------------------------
+ASSISTANT (planning):
+Entered plan mode. Read supabase/functions/alternate-lead-finder/index.ts end to
+end (Hunter domain-search -> pickCandidates by target role -> AC dedup -> insert ->
+mark processed -> append to sheet -> email Liv). Confirmed lusha_api_key.txt exists
+(36 bytes) and, importantly, that it was NOT in .gitignore. Researched the Lusha
+API: v3 prospecting is search-then-enrich (POST /v3/contacts/prospecting then
+/v3/contacts/enrich), api_key header, HTTP 402 on insufficient credits; paid
+per-datapoint. Verified gcloud is installed. Asked two clarifying questions:
+(1) how to bound Lusha spend, and (2) how to detect the switch (preflight vs
+reactive).
+
+--------------------------------------------------------------------------------
+USER:
+Pivoted away from Lusha — asked to suggest a different free service and use the
+existing Apify Starter plan instead; provided apify_api_token.txt to save in Secret
+Manager. Chose "Reactive only" for the switch trigger.
+
+--------------------------------------------------------------------------------
+ASSISTANT (planning + first build):
+Confirmed apify_api_token.txt (46 bytes); neither Apify nor Lusha were gitignored.
+Researched Apify actors and initially chose scravitylab/company-contact-scraper.
+Added the reactive fallback plumbing to index.ts: a HunterOutcome type
+(ok/exhausted/error), an apifyDomainSearch + findDomainContacts dispatcher (Hunter
+primary; switch to Apify sticky-for-the-run on exhaustion), ?aprobe / ?provider
+debug params, and fixed a latent gap so ?to= redirects the email on ?sync runs too
+(previously only ?append honoured it). Set the Supabase function secret
+APIFY_API_TOKEN via the Management API (201), created GCP secret apify-api-token in
+claudegwscli-502400, and granted roles/secretmanager.secretAccessor to the compute
+SA 659687081407-compute@ (first tried the wrong short role name, corrected it).
+Added apify_api_token.txt + lusha_api_key.txt to .gitignore. Deployed.
+
+Confirmed Hunter's real exhausted response by hitting /v2/account and domain-search
+with the local key: searches remaining 0 (resets 2026-10-10), and domain-search
+returns HTTP 429 with id "too_many_requests" and details "...limit for the number
+of searches per billing period..." — the SAME id as a plain rate-limit, so the code
+matches on the DETAILS text, not the id.
+
+--------------------------------------------------------------------------------
+ASSISTANT (actor troubleshooting — the crux):
+The first actor (scravitylab/company-contact-scraper) FAILED server-side on its own
+example domains (internal AttributeError, exit 91) — abandoned. Searched the Apify
+store and switched to scalelist/domain-email-finder, which returned clean data for
+stripe.com but 0 usable contacts for every real AU (.com.au) lead domain (HIA, AVMC,
+Austmine, villagegate). A second finder (dev00/domain-email-finder-api) also
+returned 0 for Commonwealth Bank. Conclusion: Apollo/US-database actors don't cover
+this list's AU SMBs. Cross-checked RocketReach (person_search, no credits) — it
+found 282 profiles for hia.com.au, proving the AU data exists; but that account is
+free-tier (~5 reveals/mo), so not a bulk fallback. Presented the tradeoffs to the
+user.
+
+--------------------------------------------------------------------------------
+USER:
+"im sure there are actors for AU in apify. check again."
+
+--------------------------------------------------------------------------------
+ASSISTANT:
+Re-searched with the right mechanism in mind: an actor that scrapes the company's
+OWN site + LinkedIn (geography-agnostic, like Hunter) rather than a US prospect DB.
+Found scrapersdelight/decision-maker-email-finder and verified it live on the actual
+AU domains: hia.com.au returned Jocelyn Martin (C-suite, jocelyn.martin@hia.com.au,
+MX-valid) with fields email/firstName/lastName/title/seniority/confidence/mxValid.
+Coverage confirmed. Updated the plan accordingly (with a strict data-integrity rule,
+per the user's next message) and got approval.
+
+--------------------------------------------------------------------------------
+USER:
+Instructed: never tag a closed_sequence_threads row as processed unless an actual
+lead with a real email was inserted into alternate_leads — for both the Hunter and
+Apify paths.
+
+--------------------------------------------------------------------------------
+ASSISTANT (final build):
+Implemented in index.ts:
+- Pointed APIFY_ACTOR at scrapersdelight~decision-maker-email-finder; input
+  { domains:[domain], maxContactsPerDomain, maxItems, useGoogleFallback:true }.
+- Rewrote apifyItemsToResult to map that actor's records (email, firstName/lastName
+  title-cased, title, seniority; drop no-email or mxValid===false) into the Hunter
+  shape so pickCandidates/isTargetRole are unchanged.
+- Strict rule: track inserts per source row; markProcessed ONLY when
+  insertedThisRow > 0. Removed the old unconditional mark; no-domain rows are also
+  left unprocessed. Applies uniformly to Hunter and Apify.
+Deployed. Verified end to end via the real reactive path (Hunter exhausted -> Apify)
+with ?sync=1&limit=1&to=julienne@: source craig.byrnes@infrabuild.com.au produced
+Tracey Sen, "Head of Communication Asia Pacific and Global Head of Content"
+(tracey.sen@infrabuild.com.au), appended to the sheet, preview emailed to Julienne
+(not Liv), and id 20 correctly marked processed. Updated CLAUDE.md and as_built.txt
+(reactive fallback, actor, strict rule, secrets, env knobs, debug params).
+
+--------------------------------------------------------------------------------
+USER:
+Asked to check for closed_sequence_threads rows marked processed with no
+corresponding alternate_leads, and reset them to null.
+
+--------------------------------------------------------------------------------
+ASSISTANT:
+Ran an integrity query (23 processed; 1 without a lead: id 20 infrabuild, from an
+earlier run) and reset it to null. (Also earlier reverted an id-20/id-28 test
+side-effect.) Note: I invoke() nothing here beyond SQL; matched leads to source rows
+by thread_id + source_table.
+
+--------------------------------------------------------------------------------
+USER:
+Minor: limit the initial closed_sequence_threads query to 20 rows.
+
+--------------------------------------------------------------------------------
+ASSISTANT:
+Changed the initial query to .limit(rowLimit) where rowLimit = ?limit=N if given,
+else 20 (default cap). Deployed; noted it in as_built.txt.
+
+--------------------------------------------------------------------------------
+USER:
+org should never be null in alternate_leads. If Hunter/Apify return no org, carry
+over the original lead's org — found in ai_verified_cold_leads/manually_found_cold_
+leads (cold) or ai_scraped_soc_med_leads/manually_found_leads (soc med). Also fix
+existing null-org rows in the table AND the sheet.
+
+--------------------------------------------------------------------------------
+ASSISTANT:
+Inspected the four detail tables (all have email + org + thread_id). Added
+loadOrgByEmail() (unions org keyed by original email across the four tables, ai_*
+before manually_*) and changed the org assignment to
+result.organization ?? sm?.org ?? origOrgByEmail.get(email) ?? null. Backfilled the
+DB: the one null-org row (id 38, tracey.sen@infrabuild -> "InfraBuild"); confirmed
+0 null-or-blank orgs across all 38 rows. For the sheet, SA impersonation via gcloud
+was denied and a plain gcloud token lacks the Sheets scope, so added a reusable
+?fixorg=1 maintenance endpoint (syncs the sheet's Org column to the DB by email,
+using the function's SA) and ran it — updated 1 cell (C39) to "InfraBuild". Updated
+CLAUDE.md and as_built.txt with the never-null rule and ?fixorg=1.
+
+--------------------------------------------------------------------------------
+USER:
+Create a global skill to only perform the chat-history-documenting part of the dcp
+skill.
+
+--------------------------------------------------------------------------------
+ASSISTANT:
+Read the global dcp SKILL.md, extracted step 1 (save the transcript to
+chat_history/ with the mandatory secret-redaction gate), and created a new global
+skill at ~/.claude/skills/save-chat-history/SKILL.md that does ONLY that — no
+as_built.txt, no CLAUDE.md, no git commit/push — and points the user to /dcp for the
+full flow.
+
+--------------------------------------------------------------------------------
+USER:
+Ran /save-chat-history.
+
+--------------------------------------------------------------------------------
+ASSISTANT:
+Wrote this chat-history file. Did NOT touch as_built.txt or CLAUDE.md and did NOT
+commit or push. (Deployed edge-function version at session end: v21. Uncommitted
+working-tree changes remain: index.ts, CLAUDE.md, as_built.txt, .gitignore.)
+
+================================================================================
+END OF EXPORT
+================================================================================

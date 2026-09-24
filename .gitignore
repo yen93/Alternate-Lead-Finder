@@ -1,6 +1,8 @@
 # --- Secrets / credentials (NEVER commit) ---
 hunter_io_api_key.txt
 supabase_access_token.txt
+apify_api_token.txt
+lusha_api_key.txt
 *.env
 .env
 *.pem

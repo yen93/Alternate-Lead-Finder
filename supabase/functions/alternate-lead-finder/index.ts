@@ -23,6 +23,16 @@ const GOOGLE_SA_JSON = Deno.env.get("GOOGLE_SERVICE_ACCOUNT_JSON") ?? "";
 const AC_API_URL = (Deno.env.get("AC_API_URL") ?? "").replace(/\/+$/, "");
 const AC_API_TOKEN = Deno.env.get("AC_API_TOKEN") ?? "";
 
+// Apify fallback (used only when Hunter's plan credits are exhausted). Actor
+// scrapersdelight/decision-maker-email-finder scrapes the company's OWN site +
+// LinkedIn (geography-agnostic, like Hunter) and returns decision-maker records
+// with name, title, best-guess work email, pattern, confidence and MX validation.
+// API slug uses `~` in the run URL path.
+const APIFY_API_TOKEN = Deno.env.get("APIFY_API_TOKEN") ?? "";
+const APIFY_ACTOR = Deno.env.get("APIFY_ACTOR") ?? "scrapersdelight~decision-maker-email-finder";
+const APIFY_LIMIT = parseInt(Deno.env.get("APIFY_LIMIT") ?? "10", 10); // contacts per domain
+const APIFY_MAX_DOMAINS = parseInt(Deno.env.get("APIFY_MAX_DOMAINS") ?? "80", 10);
+
 // Sales sheet + tab the alternate leads are appended to.
 const SPREADSHEET_ID = Deno.env.get("SALES_SHEET_ID") ?? "1svksxHmNBUx9Z20t2kbtHAT1fThcfdCmz5dEp936L7I";
 const SHEET_TAB = Deno.env.get("ALT_LEADS_TAB") ?? "alternate_leads_found";
@@ -68,33 +78,135 @@ function isTargetRole(e: HunterEmail): boolean {
   return TARGET_ROLE_KEYWORDS.some((kw) => hay.includes(kw));
 }
 
-async function hunterDomainSearch(domain: string): Promise<HunterResult | null> {
+// Outcome of a Hunter lookup. `exhausted` means the plan's search credits are
+// used up (switch to the Apify fallback); `error` is transient (retry next run).
+type HunterOutcome =
+  | { status: "ok"; result: HunterResult }
+  | { status: "exhausted" }
+  | { status: "error" };
+
+// A 429 from Hunter is ambiguous: it fires both for per-second rate limiting AND
+// for the monthly plan quota being used up. They share id "too_many_requests";
+// only the details text distinguishes them ("...limit for the number of searches
+// per billing period..."). Treat the plan-quota variant as `exhausted`.
+function hunterQuotaExhausted(body: string): boolean {
+  return /billing period|number of searches|per your plan|upgrade your plan/i.test(body);
+}
+
+async function hunterDomainSearch(domain: string): Promise<HunterOutcome> {
   if (!HUNTER_API_KEY) {
     console.warn("HUNTER_IO_API_KEY not set — cannot search domains.");
-    return null;
+    return { status: "error" };
   }
   // limit=10 is the Free plan's max page size (higher values return HTTP 400).
   const url = `https://api.hunter.io/v2/domain-search?domain=${encodeURIComponent(domain)}&limit=10&api_key=${HUNTER_API_KEY}`;
   try {
     const res = await fetch(url);
-    if (res.status === 429) {
-      console.warn(`Hunter 429 (rate limited) for ${domain} — skipping.`);
-      return null;
-    }
     if (!res.ok) {
-      console.warn(`Hunter ${res.status} for ${domain} — skipping.`);
-      return null;
+      const body = await res.text();
+      if ((res.status === 429 || res.status === 403) && hunterQuotaExhausted(body)) {
+        console.warn(`Hunter plan credits exhausted (${res.status}) for ${domain}.`);
+        return { status: "exhausted" };
+      }
+      console.warn(`Hunter ${res.status} for ${domain} — skipping. ${body.slice(0, 160)}`);
+      return { status: "error" };
     }
     const json = await res.json();
     const data = json?.data ?? {};
     return {
-      organization: data.organization ?? null,
-      emails: Array.isArray(data.emails) ? data.emails : [],
+      status: "ok",
+      result: {
+        organization: data.organization ?? null,
+        emails: Array.isArray(data.emails) ? data.emails : [],
+      },
     };
   } catch (err) {
     console.warn(`Hunter fetch failed for ${domain}: ${err}`);
+    return { status: "error" };
+  }
+}
+
+// --- Apify fallback ---------------------------------------------------------
+interface RunState { useApify: boolean; apifyDomainsUsed: number }
+
+// Map the Apify decision-maker-email-finder dataset (a flat array of records:
+// { email, firstName, lastName, title, seniority, confidence, mxValid, ... }) to
+// the Hunter shape so the rest of the pipeline (pickCandidates / isTargetRole /
+// scoreContact) is unchanged. This actor guesses emails from the company's site,
+// so we drop records with no email or an undeliverable domain (mxValid === false).
+function apifyItemsToResult(items: Record<string, unknown>[]): HunterResult {
+  const cap = (s: unknown): string | null => {
+    const t = typeof s === "string" ? s.trim() : "";
+    return t ? t.charAt(0).toUpperCase() + t.slice(1) : null;
+  };
+  const emails: HunterEmail[] = [];
+  for (const it of items) {
+    const val = (it.email ?? "") as string;
+    if (!val) continue;                 // no usable email
+    if (it.mxValid === false) continue; // domain can't receive mail
+    emails.push({
+      value: val,
+      first_name: cap(it.firstName),
+      last_name: cap(it.lastName),
+      position: (it.title ?? null) as string | null,
+      department: null,
+      seniority: (it.seniority ?? null) as string | null,
+      type: "personal", // named decision-makers — treat as personal (scored/kept)
+    });
+  }
+  // This actor has no reliable per-domain org name field; org is left to the
+  // soc-med context fallback (or null for cold leads).
+  return { organization: null, emails };
+}
+
+async function apifyDomainSearch(domain: string, state: RunState): Promise<HunterResult | null> {
+  if (!APIFY_API_TOKEN) {
+    console.warn("APIFY_API_TOKEN not set — cannot run Apify fallback.");
     return null;
   }
+  if (state.apifyDomainsUsed >= APIFY_MAX_DOMAINS) {
+    console.warn(`Apify per-run cap (${APIFY_MAX_DOMAINS}) reached — leaving ${domain} for next run.`);
+    return null;
+  }
+  const url = `https://api.apify.com/v2/acts/${APIFY_ACTOR}/run-sync-get-dataset-items?token=${APIFY_API_TOKEN}`;
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ domains: [domain], maxContactsPerDomain: APIFY_LIMIT, maxItems: APIFY_LIMIT, useGoogleFallback: true }),
+    });
+    if (!res.ok) {
+      console.warn(`Apify ${res.status} for ${domain} — skipping. ${(await res.text()).slice(0, 160)}`);
+      return null;
+    }
+    state.apifyDomainsUsed++;
+    const items = await res.json();
+    if (!Array.isArray(items) || items.length === 0) {
+      console.log(`Apify returned no data for ${domain}.`);
+      return { organization: null, emails: [] };
+    }
+    return apifyItemsToResult(items as Record<string, unknown>[]);
+  } catch (err) {
+    console.warn(`Apify fetch failed for ${domain}: ${err}`);
+    return null;
+  }
+}
+
+// Provider dispatcher: Hunter is primary; switch to Apify (sticky for the rest of
+// the run) the first time Hunter reports its plan credits are exhausted.
+async function findDomainContacts(domain: string, state: RunState): Promise<HunterResult | null> {
+  if (!state.useApify) {
+    const h = await hunterDomainSearch(domain);
+    if (h.status === "ok") return h.result;
+    if (h.status === "exhausted") {
+      console.warn("Hunter credits exhausted — switching to Apify fallback for the rest of this run.");
+      state.useApify = true;
+      // fall through to Apify for this same domain
+    } else {
+      return null; // transient — leave the row unprocessed so it retries
+    }
+  }
+  return await apifyDomainSearch(domain, state);
 }
 
 // Pick candidates for one org: up to 5 target-role contacts, else 1 fallback.
@@ -267,6 +379,79 @@ async function sheetsAppend(token: string, rows: (string | number | null)[][]): 
   if (!r.ok) throw new Error(`Sheets append failed: ${d.error?.message ?? r.status}`);
 }
 
+// 0-based column index -> A1 letter (0 -> A, 26 -> AA).
+function colLetter(idx0: number): string {
+  let n = idx0 + 1, s = "";
+  while (n > 0) { const m = (n - 1) % 26; s = String.fromCharCode(65 + m) + s; n = Math.floor((n - 1) / 26); }
+  return s;
+}
+
+async function sheetsGetAllValues(token: string): Promise<string[][]> {
+  const r = await fetch(
+    `https://sheets.googleapis.com/v4/spreadsheets/${SPREADSHEET_ID}/values/${encodeURIComponent(SHEET_TAB)}`,
+    { headers: { Authorization: `Bearer ${token}` } },
+  );
+  const d = await r.json();
+  if (!r.ok) throw new Error(`Sheets get values failed: ${d.error?.message ?? r.status}`);
+  return (d.values ?? []) as string[][];
+}
+
+async function sheetsBatchUpdateCells(token: string, data: { range: string; values: string[][] }[]): Promise<void> {
+  if (data.length === 0) return;
+  const r = await fetch(
+    `https://sheets.googleapis.com/v4/spreadsheets/${SPREADSHEET_ID}/values:batchUpdate`,
+    {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ valueInputOption: "USER_ENTERED", data }),
+    },
+  );
+  const d = await r.json();
+  if (!r.ok) throw new Error(`Sheets batchUpdate failed: ${d.error?.message ?? r.status}`);
+}
+
+// Maintenance: sync the sheet's Org column to the DB (org must never be blank once
+// the DB has it). Matches sheet rows to alternate_leads by email. Used by ?fixorg=1.
+async function fixSheetOrgs(db: SupabaseClient): Promise<Record<string, unknown>> {
+  const token = await getGoogleAccessToken("https://www.googleapis.com/auth/spreadsheets");
+  const values = await sheetsGetAllValues(token);
+  if (values.length < 2) return { updated: 0, note: "no data rows" };
+  const header = values[0].map((h) => (h ?? "").trim().toLowerCase());
+  const emailCol = header.findIndex((h) => /email/.test(h));
+  const orgCol = header.findIndex((h) => /(org|company|organi[sz]ation)/.test(h));
+  if (emailCol < 0 || orgCol < 0) return { error: `email/org column not found (email=${emailCol}, org=${orgCol})` };
+
+  // DB org keyed by lowercased email.
+  const orgByEmail = new Map<string, string>();
+  const pageSize = 1000;
+  let from = 0;
+  while (true) {
+    const { data, error } = await db.from("alternate_leads").select("email, org").range(from, from + pageSize - 1);
+    if (error) { console.warn(`fixSheetOrgs load: ${error.message}`); break; }
+    if (!data || data.length === 0) break;
+    for (const r of data as Record<string, unknown>[]) {
+      const e = typeof r.email === "string" ? r.email.toLowerCase() : "";
+      const o = typeof r.org === "string" ? r.org.trim() : "";
+      if (e && o) orgByEmail.set(e, o);
+    }
+    if (data.length < pageSize) break;
+    from += pageSize;
+  }
+
+  const orgA1 = colLetter(orgCol);
+  const updates: { range: string; values: string[][] }[] = [];
+  for (let i = 1; i < values.length; i++) {
+    const email = (values[i][emailCol] ?? "").trim().toLowerCase();
+    if (!email) continue;
+    const dbOrg = orgByEmail.get(email);
+    if (!dbOrg) continue;
+    const cur = (values[i][orgCol] ?? "").trim();
+    if (cur !== dbOrg) updates.push({ range: `'${SHEET_TAB}'!${orgA1}${i + 1}`, values: [[dbOrg]] });
+  }
+  await sheetsBatchUpdateCells(token, updates);
+  return { updated: updates.length, cells: updates.map((u) => u.range) };
+}
+
 // --- Gmail helper -----------------------------------------------------------
 async function gmailSend(token: string, from: string, to: string, subject: string, html: string): Promise<void> {
   const mime = [
@@ -307,19 +492,22 @@ async function acContactExists(email: string): Promise<boolean> {
   }
 }
 
-async function run(limit?: number): Promise<Record<string, unknown>> {
+async function run(limit?: number, opts?: { forceApify?: boolean; notifyTo?: string }): Promise<Record<string, unknown>> {
   const db = createClient(SUPABASE_URL, SERVICE_ROLE_KEY, {
     auth: { persistSession: false },
   });
+  const state: RunState = { useApify: opts?.forceApify ?? false, apifyDomainsUsed: 0 };
 
-  // 1. Unresponsive leads to process. Optional `limit` caps the batch (testing).
-  let query = db
+  // 1. Unresponsive leads to process. Capped at 20 rows per run by default; the
+  //    `?limit=N` param overrides it (testing).
+  const rowLimit = limit && limit > 0 ? limit : 20;
+  const query = db
     .from("closed_sequence_threads")
     .select("id, thread_id, source_table, email")
     .not("email", "is", null)
     .or("is_processed.is.null,is_processed.eq.false")
-    .order("id", { ascending: true });
-  if (limit && limit > 0) query = query.limit(limit);
+    .order("id", { ascending: true })
+    .limit(rowLimit);
   const { data: rows, error: qErr } = await query;
   if (qErr) {
     console.error(`Query closed_sequence_threads failed: ${qErr.message}`);
@@ -342,6 +530,11 @@ async function run(limit?: number): Promise<Record<string, unknown>> {
   const followCtx = await loadContext(db, "follow_up_sequence_threads", threadIds, ["speaker", "subject", "poc_firstname", "source_type_id"]);
   const coldCtx = await loadContext(db, "cold_leads_follow_up_sequence_threads", threadIds, ["speaker", "subject", "poc_firstname", "source_type_id"]);
   const socMedCtx = await loadSocMed(db, threadIds, emails);
+  // org must never be null on an alternate lead: when Hunter/Apify return no org,
+  // carry over the ORIGINAL lead's org, looked up by the original email across the
+  // cold detail tables (ai_verified_cold_leads, manually_found_cold_leads) and the
+  // soc-med detail tables (ai_scraped_soc_med_leads, manually_found_leads).
+  const origOrgByEmail = await loadOrgByEmail(db, emails);
 
   const domainCache = new Map<string, HunterResult | null>();
   const insertedThisRun = new Set<string>();
@@ -352,24 +545,27 @@ async function run(limit?: number): Promise<Record<string, unknown>> {
     const email = row.email as string;
     const domain = domainOf(email);
     if (!domain) {
-      await markProcessed(db, row.id);
+      // No parseable domain -> no lead possible. Per the strict rule we do NOT
+      // mark it processed (only a real inserted lead does that); the skip is free.
+      console.warn(`Row ${row.id} has no parseable domain from "${email}" — skipping (left unprocessed).`);
       continue;
     }
 
     let result = domainCache.get(domain);
     if (result === undefined) {
-      result = await hunterDomainSearch(domain);
+      result = await findDomainContacts(domain, state);
       domainCache.set(domain, result);
       await sleep(HUNTER_DELAY_MS);
     }
 
     if (result === null) {
-      // Hunter errored / rate-limited / no key — leave unprocessed so it retries
-      // next run rather than silently burning the row.
-      console.warn(`No Hunter result for ${domain} — leaving row ${row.id} unprocessed for retry.`);
+      // Provider errored / rate-limited / no key / cap hit — leave unprocessed so
+      // it retries next run rather than silently burning the row.
+      console.warn(`No provider result for ${domain} — leaving row ${row.id} unprocessed for retry.`);
       continue;
     }
 
+    let insertedThisRow = 0;
     {
       const excluded = new Set<string>([...acEmails, ...existingAlt, ...insertedThisRun]);
       const candidates = pickCandidates(result, email, excluded);
@@ -385,7 +581,7 @@ async function run(limit?: number): Promise<Record<string, unknown>> {
       const event = (leadType === "soc med")
         ? (sm?.event_name ?? eventFromSubject(subject))
         : null;
-      const org = result.organization ?? sm?.org ?? null;
+      const org = result.organization ?? sm?.org ?? origOrgByEmail.get(email.toLowerCase()) ?? null;
 
       for (const c of candidates) {
         const vLower = c.value.toLowerCase();
@@ -415,21 +611,31 @@ async function run(limit?: number): Promise<Record<string, unknown>> {
         }
         insertedThisRun.add(vLower);
         inserted++;
+        insertedThisRow++;
       }
     }
 
-    // 4. Mark the source row processed (Hunter responded; nothing more to retry).
-    await markProcessed(db, row.id);
-    processed++;
+    // 4. Mark the source row processed ONLY when a real alternate lead (with an
+    //    email) was actually inserted for it. If the provider found nothing, or
+    //    every candidate was already known (deduped away), leave the row
+    //    unprocessed so it retries next run — no row is burned without a lead.
+    if (insertedThisRow > 0) {
+      await markProcessed(db, row.id);
+      processed++;
+    } else {
+      console.log(`No new lead inserted for row ${row.id} (${domain}) — leaving unprocessed to retry.`);
+    }
   }
 
   console.log(`Inserted ${inserted} alternate lead(s) across ${domainCache.size} domain(s).`);
 
-  // 5. Append newly found leads to the sales sheet, then email Liv a preview.
-  const sheetResult = await appendToSheetAndNotify(db);
+  // 5. Append newly found leads to the sales sheet, then email Liv a preview
+  //    (?to= redirects the notification during testing so Liv isn't emailed).
+  const sheetResult = await appendToSheetAndNotify(db, opts?.notifyTo);
 
   return {
     rows: rows.length, processed, inserted, domains: domainCache.size,
+    provider: state.useApify ? "apify" : "hunter", apifyDomains: state.apifyDomainsUsed,
     acEmails: acEmails.size, acLiveFallback: acTableEmpty, ...sheetResult,
   };
 }
@@ -555,6 +761,28 @@ async function appendToSheetAndNotify(db: SupabaseClient, toOverride?: string): 
   return result;
 }
 
+// Original lead's org, keyed by lowercased original email, unioned across the four
+// source-detail tables. ai_* sources take precedence over manually_* (first write
+// wins). Used to guarantee alternate_leads.org is never null.
+async function loadOrgByEmail(db: SupabaseClient, emails: string[]): Promise<Map<string, string>> {
+  const map = new Map<string, string>();
+  if (emails.length === 0) return map;
+  const tables = [
+    "ai_verified_cold_leads", "manually_found_cold_leads", // cold sources
+    "ai_scraped_soc_med_leads", "manually_found_leads",    // soc-med sources
+  ];
+  for (const t of tables) {
+    const { data, error } = await db.from(t).select("email, org").in("email", emails);
+    if (error) { console.warn(`loadOrgByEmail(${t}) error: ${error.message}`); continue; }
+    for (const r of (data ?? []) as Record<string, unknown>[]) {
+      const e = typeof r.email === "string" ? r.email.toLowerCase() : "";
+      const org = typeof r.org === "string" ? r.org.trim() : "";
+      if (e && org && !map.has(e)) map.set(e, org);
+    }
+  }
+  return map;
+}
+
 interface Ctx { speaker?: string | null; subject?: string | null; poc_firstname?: string | null; source_type_id?: number | null }
 async function loadContext(
   db: SupabaseClient,
@@ -633,6 +861,18 @@ Deno.serve(async (req: Request) => {
     }
   }
 
+  // Maintenance: ?fixorg=1 syncs the sheet's Org column to the DB (fills blanks /
+  // corrects drift) by matching sheet rows to alternate_leads on email. No sends.
+  if (params.get("fixorg") === "1") {
+    try {
+      const db = createClient(SUPABASE_URL, SERVICE_ROLE_KEY, { auth: { persistSession: false } });
+      const res = await fixSheetOrgs(db);
+      return Response.json({ status: "done", ...res });
+    } catch (err) {
+      return Response.json({ status: "error", error: String(err) }, { status: 500 });
+    }
+  }
+
   // Debug: ?inspect=1 verifies Sheets access (tabs + header) and Gmail
   // delegation (token only, no send), so we can confirm setup before going live.
   if (params.get("inspect") === "1") {
@@ -675,11 +915,36 @@ Deno.serve(async (req: Request) => {
     return Response.json(info);
   }
 
+  // Debug: ?aprobe=<domain> runs the Apify fallback actor directly and reports the
+  // raw HTTP status + a body snippet, to confirm the actor's field names/mapping.
+  if (params.get("aprobe")) {
+    const dom = params.get("aprobe")!;
+    const info: Record<string, unknown> = { apifyKeyLen: APIFY_API_TOKEN.length, actor: APIFY_ACTOR };
+    try {
+      const r = await fetch(`https://api.apify.com/v2/acts/${APIFY_ACTOR}/run-sync-get-dataset-items?token=${APIFY_API_TOKEN}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ domains: [dom], maxContactsPerDomain: APIFY_LIMIT, maxItems: APIFY_LIMIT, useGoogleFallback: true }),
+      });
+      const body = await r.text();
+      info.status = r.status;
+      info.bodySnippet = body.slice(0, 800);
+    } catch (err) {
+      info.fetchError = String(err);
+    }
+    return Response.json(info);
+  }
+
+  // ?provider=apify forces the Apify fallback path (skips Hunter) for testing.
+  // ?to= redirects the notification email (use when testing so Liv isn't emailed).
+  const forceApify = params.get("provider") === "apify";
+  const notifyTo = params.get("to") ?? undefined;
+
   // Debug/testing: ?sync=1 awaits the work and returns the outcome (or error)
   // in the response, so failures are visible instead of vanishing in the bg task.
   if (params.get("sync") === "1") {
     try {
-      const result = await run(limit);
+      const result = await run(limit, { forceApify, notifyTo });
       return Response.json({ status: "done", ...result });
     } catch (err) {
       console.error(`run() crashed: ${err}`);
@@ -687,7 +952,7 @@ Deno.serve(async (req: Request) => {
     }
   }
 
-  const work = run(limit).catch((err) => console.error(`run() crashed: ${err}`));
+  const work = run(limit, { forceApify, notifyTo }).catch((err) => console.error(`run() crashed: ${err}`));
   if (typeof EdgeRuntime !== "undefined") {
     EdgeRuntime.waitUntil(work);
   }
