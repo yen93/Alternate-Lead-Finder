@@ -33,6 +33,28 @@ const APIFY_ACTOR = Deno.env.get("APIFY_ACTOR") ?? "scrapersdelight~decision-mak
 const APIFY_LIMIT = parseInt(Deno.env.get("APIFY_LIMIT") ?? "10", 10); // contacts per domain
 const APIFY_MAX_DOMAINS = parseInt(Deno.env.get("APIFY_MAX_DOMAINS") ?? "80", 10);
 
+// Wall-clock guard. The edge isolate is hard-killed at ~150s, and the
+// append-to-sheet + email step runs only AFTER the processing loop — so a run that
+// times out mid-loop (esp. on the slow Apify fallback, ~1 min/domain) inserts leads
+// into the DB but never flushes them to the sheet or emails a preview. We stop
+// starting new provider calls before the budget is spent so the flush always runs.
+const WALL_CLOCK_MS = parseInt(Deno.env.get("WALL_CLOCK_MS") ?? "150000", 10);
+const APPEND_RESERVE_MS = parseInt(Deno.env.get("APPEND_RESERVE_MS") ?? "15000", 10); // headroom for the sheet+email flush
+const HUNTER_CALL_RESERVE_MS = parseInt(Deno.env.get("HUNTER_CALL_RESERVE_MS") ?? "8000", 10); // worst-case one Hunter call
+const APIFY_CALL_RESERVE_MS = parseInt(Deno.env.get("APIFY_CALL_RESERVE_MS") ?? "70000", 10); // worst-case one Apify actor run
+
+// OpenAI org resolver. Last-resort org lookup for alternate_leads.org (which must
+// never be null): the Apify actor returns no company name, and some leads have no
+// org anywhere in the DB to carry over. When every other source is empty we ask an
+// OpenAI model for the company that owns the domain, grounded on the domain + the
+// contact's name/title. On any failure/uncertainty we fall back to the bare domain,
+// so org is guaranteed non-null.
+const OPENAI_API_KEY = Deno.env.get("OPENAI_API_KEY") ?? "";
+// Uses the Responses API with the web_search tool, so the model actually looks the
+// domain up instead of guessing (a non-browsing model hallucinated e.g. hia.com.au).
+// Must be a model that supports web_search_preview.
+const OPENAI_MODEL = Deno.env.get("OPENAI_MODEL") ?? "gpt-4o";
+
 // Sales sheet + tab the alternate leads are appended to.
 const SPREADSHEET_ID = Deno.env.get("SALES_SHEET_ID") ?? "1svksxHmNBUx9Z20t2kbtHAT1fThcfdCmz5dEp936L7I";
 const SHEET_TAB = Deno.env.get("ALT_LEADS_TAB") ?? "alternate_leads_found";
@@ -497,6 +519,7 @@ async function run(limit?: number, opts?: { forceApify?: boolean; notifyTo?: str
     auth: { persistSession: false },
   });
   const state: RunState = { useApify: opts?.forceApify ?? false, apifyDomainsUsed: 0 };
+  const runStarted = Date.now();
 
   // 1. Unresponsive leads to process. Capped at 20 rows per run by default; the
   //    `?limit=N` param overrides it (testing).
@@ -537,9 +560,11 @@ async function run(limit?: number, opts?: { forceApify?: boolean; notifyTo?: str
   const origOrgByEmail = await loadOrgByEmail(db, emails);
 
   const domainCache = new Map<string, HunterResult | null>();
+  const orgCache = new Map<string, string>(); // resolved org per domain (incl. OpenAI last-resort)
   const insertedThisRun = new Set<string>();
   let inserted = 0;
   let processed = 0;
+  let stoppedEarly = false;
 
   for (const row of rows) {
     const email = row.email as string;
@@ -553,6 +578,16 @@ async function run(limit?: number, opts?: { forceApify?: boolean; notifyTo?: str
 
     let result = domainCache.get(domain);
     if (result === undefined) {
+      // Wall-clock guard — only before an actual provider call (cache misses are
+      // free). If starting one risks overrunning the isolate's hard kill, stop the
+      // loop now so the append+email flush below still runs and this run's inserts
+      // reach the sheet. Remaining rows are left unprocessed and retry next run.
+      const callReserve = state.useApify ? APIFY_CALL_RESERVE_MS : HUNTER_CALL_RESERVE_MS;
+      if (Date.now() - runStarted > WALL_CLOCK_MS - APPEND_RESERVE_MS - callReserve) {
+        stoppedEarly = true;
+        console.warn(`Wall-clock budget nearly spent — stopping before ${domain} (row ${row.id}); ${inserted} lead(s) inserted so far. Remaining rows left unprocessed for retry; flushing to sheet.`);
+        break;
+      }
       result = await findDomainContacts(domain, state);
       domainCache.set(domain, result);
       await sleep(HUNTER_DELAY_MS);
@@ -581,7 +616,21 @@ async function run(limit?: number, opts?: { forceApify?: boolean; notifyTo?: str
       const event = (leadType === "soc med")
         ? (sm?.event_name ?? eventFromSubject(subject))
         : null;
-      const org = result.organization ?? sm?.org ?? origOrgByEmail.get(email.toLowerCase()) ?? null;
+      // org must never be null. Order: provider org (Hunter) -> soc-med context ->
+      // carry over the original lead's org by email -> OpenAI resolver (domain +
+      // contact hint, cached per domain) -> bare domain. Only resolved when there
+      // is at least one candidate to insert, so we don't spend an OpenAI call on a
+      // row that inserts nothing.
+      let org: string | null = result.organization ?? sm?.org ?? origOrgByEmail.get(email.toLowerCase()) ?? null;
+      if ((!org || !org.trim()) && candidates.length > 0) {
+        if (!orgCache.has(domain)) {
+          const c0 = candidates[0];
+          const hint = [[c0.first_name, c0.last_name].filter(Boolean).join(" "), c0.position]
+            .filter(Boolean).join(", ");
+          orgCache.set(domain, await resolveOrgViaOpenAI(domain, hint || undefined));
+        }
+        org = orgCache.get(domain)!;
+      }
 
       for (const c of candidates) {
         const vLower = c.value.toLowerCase();
@@ -627,14 +676,14 @@ async function run(limit?: number, opts?: { forceApify?: boolean; notifyTo?: str
     }
   }
 
-  console.log(`Inserted ${inserted} alternate lead(s) across ${domainCache.size} domain(s).`);
+  console.log(`Inserted ${inserted} alternate lead(s) across ${domainCache.size} domain(s).${stoppedEarly ? " (stopped early on wall-clock budget — remaining rows retry next run)" : ""}`);
 
   // 5. Append newly found leads to the sales sheet, then email Liv a preview
   //    (?to= redirects the notification during testing so Liv isn't emailed).
   const sheetResult = await appendToSheetAndNotify(db, opts?.notifyTo);
 
   return {
-    rows: rows.length, processed, inserted, domains: domainCache.size,
+    rows: rows.length, processed, inserted, domains: domainCache.size, stoppedEarly,
     provider: state.useApify ? "apify" : "hunter", apifyDomains: state.apifyDomainsUsed,
     acEmails: acEmails.size, acLiveFallback: acTableEmpty, ...sheetResult,
   };
@@ -781,6 +830,49 @@ async function loadOrgByEmail(db: SupabaseClient, emails: string[]): Promise<Map
     }
   }
   return map;
+}
+
+// Last-resort org lookup via an OpenAI model. Returns a company name, or the bare
+// domain when OpenAI is unavailable / errors / is unsure — never null/blank. `hint`
+// is light grounding (the contact's name + title) to disambiguate the domain.
+async function resolveOrgViaOpenAI(domain: string, hint?: string): Promise<string> {
+  if (!OPENAI_API_KEY) return domain; // not configured — fall back to the domain
+  try {
+    const input = `What is the official name of the organization that owns the website `
+      + `domain ${domain}?` + (hint ? ` A known contact there: ${hint}.` : "")
+      + ` Reply with ONLY the organization name and nothing else. If you cannot `
+      + `determine it with confidence, reply with exactly: ${domain}`;
+    const res = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${OPENAI_API_KEY}` },
+      body: JSON.stringify({
+        model: OPENAI_MODEL,
+        tools: [{ type: "web_search_preview" }],
+        input,
+      }),
+    });
+    if (!res.ok) {
+      console.warn(`OpenAI org lookup ${res.status} for ${domain} — using domain. ${(await res.text()).slice(0, 160)}`);
+      return domain;
+    }
+    const data = await res.json();
+    // Responses API: output is an array of items; the assistant `message` item holds
+    // the answer as an `output_text` content part.
+    let text = "";
+    for (const o of (data?.output ?? [])) {
+      if (o?.type !== "message") continue;
+      for (const c of (o?.content ?? [])) {
+        if (c?.type === "output_text" && typeof c.text === "string") text = c.text;
+      }
+    }
+    const org = text.trim().replace(/^["']|["']$/g, "").trim();
+    if (!org) return domain;
+    console.log(`OpenAI resolved org for ${domain}: "${org}".`);
+    return org;
+  } catch (err) {
+    console.warn(`OpenAI org lookup failed for ${domain}: ${err} — using domain.`);
+    return domain;
+  }
 }
 
 interface Ctx { speaker?: string | null; subject?: string | null; poc_firstname?: string | null; source_type_id?: number | null }
@@ -933,6 +1025,14 @@ Deno.serve(async (req: Request) => {
       info.fetchError = String(err);
     }
     return Response.json(info);
+  }
+
+  // Debug: ?orgprobe=<domain> runs the OpenAI last-resort org resolver directly and
+  // returns what it would store, without writing anything. Optional &hint=<text>.
+  if (params.get("orgprobe")) {
+    const dom = params.get("orgprobe")!;
+    const org = await resolveOrgViaOpenAI(dom, params.get("hint") ?? undefined);
+    return Response.json({ domain: dom, model: OPENAI_MODEL, openaiKeyLen: OPENAI_API_KEY.length, org });
   }
 
   // ?provider=apify forces the Apify fallback path (skips Hunter) for testing.

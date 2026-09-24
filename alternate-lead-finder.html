@@ -108,6 +108,28 @@
     line-height: 1.6;
     margin: 0 0 4px 0;
   }
+  /* Green-lined box marking parts added or changed in the latest update. */
+  .changed {
+    border: 2px solid #2e7d32;
+    background: #f1f8f1;
+    border-radius: 6px;
+    padding: 14px 18px;
+    margin: 0 0 16px 0;
+  }
+  .changed .changed-tag {
+    display: inline-block;
+    background: #2e7d32;
+    color: #ffffff;
+    font-family: 'Lato', sans-serif;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.6px;
+    text-transform: uppercase;
+    padding: 2px 8px;
+    border-radius: 3px;
+    margin-bottom: 10px;
+  }
+  .changed p:last-child, .changed ul:last-child { margin-bottom: 0; }
 </style>
 </head>
 <body>
@@ -141,6 +163,10 @@
       <li>Skips anyone whose email is already one of our ActiveCampaign contacts, so we don't double up.</li>
       <li>Saves each new lead, adds it to the sales sheet, and emails Liv a preview.</li>
     </ul>
+    <div class="changed">
+      <span class="changed-tag">New</span>
+      <p><strong>Automatic fallback when Hunter.io runs out.</strong> If Hunter.io's monthly free searches are used up, the finder now automatically switches to a second lookup service (Apify) for the rest of that run — so it keeps finding leads instead of stopping until the allowance resets. The fallback kicks in only once Hunter.io is exhausted, and it covers Australian (.com.au) companies well.</p>
+    </div>
   </div>
 </div>
 
@@ -193,6 +219,10 @@
       <li><strong>The sales sheet</strong> — new leads are appended to the <code>alternate_leads_found</code> tab of the sales spreadsheet, ready for the team to action. <a href="https://docs.google.com/spreadsheets/d/1svksxHmNBUx9Z20t2kbtHAT1fThcfdCmz5dEp936L7I/edit">Open the sales sheet</a>.</li>
       <li><strong>An email to Liv</strong> — after new leads are added, Liv receives a summary email with a preview table of the leads and a link to the sheet for review.</li>
     </ul>
+    <div class="changed">
+      <span class="changed-tag">Updated</span>
+      <p><strong>The company name is always filled in.</strong> If the lookup service doesn't return a company name, the finder fills the <em>Org</em> column another way — first by carrying over the company of the original lead, and if that isn't on record either, by using an AI web search (OpenAI) to identify the company from its website address. So the <em>Org</em> column is never left blank, even for a brand-new company we've never contacted before.</p>
+    </div>
   </div>
 </div>
 
@@ -223,6 +253,10 @@
       <li><strong>Health check</strong> — confirms the sheet, email, and ActiveCampaign connections are all working, without processing anything.</li>
     </ul>
     <p>A normal run replies instantly with a "started" message and then keeps working in the background for a minute or two — that "started" reply means it launched successfully, not that anything went wrong. Check the results in the <code>alternate_leads</code> table, the sales sheet, or Liv's inbox.</p>
+    <div class="changed">
+      <span class="changed-tag">New</span>
+      <p><strong>Fix sheet organisations.</strong> A new maintenance command re-fills the <em>Org</em> column on the sales sheet from the master records, matching rows by email — handy for tidying up any older rows that were added before company names were always captured.</p>
+    </div>
   </div>
 </div>
 
@@ -232,10 +266,97 @@
 <div class="content-band">
   <div class="col">
     <ul>
-      <li><strong>Hunter.io allowance.</strong> The lookup service is currently on the free plan, which allows about 50 company searches per month. A single run can only enrich around 50 companies, so clearing a large backlog in one go needs a paid Hunter.io plan.</li>
-      <li><strong>Nothing is wasted on errors.</strong> If a lookup fails or the monthly allowance runs out, that lead is simply left for next time rather than being marked done — so it will be retried, not lost.</li>
       <li><strong>The sheet tab is set up automatically.</strong> The first time it runs, it creates the column headings on the <code>alternate_leads_found</code> tab if they aren't there yet.</li>
     </ul>
+    <div class="changed">
+      <span class="changed-tag">Updated</span>
+      <ul>
+        <li><strong>Hunter.io allowance — now with automatic fallback.</strong> Hunter.io is on the free plan (~50 company searches per month). When that allowance is used up, the finder switches to the Apify fallback for the rest of the run instead of stopping, so leads keep coming in until Hunter.io resets.</li>
+        <li><strong>A lead is only marked done when a real contact is found.</strong> A company is marked processed only when an actual alternate lead — with a real email — has been saved for it. If a lookup finds nothing, errors, or everyone found is already a known contact, that company is left to try again next time rather than being used up.</li>
+        <li><strong>Up to 20 companies per run.</strong> Each run now processes at most 20 outstanding leads; the rest roll over to the following run.</li>
+      </ul>
+    </div>
+    <div class="changed">
+      <span class="changed-tag">New</span>
+      <p><strong>Long fallback runs no longer lose results.</strong> Each run has a limited time to finish, and the Apify fallback is slower because it looks up one company at a time — so a run leaning on it could previously reach that time limit before saving anything. The finder now watches the clock: if it's about to run out of time, it stops taking on new companies, saves everything it has already found to the sheet, and emails the preview — then the companies it didn't reach are simply picked up on the next run. Nothing it finds is ever lost.</p>
+    </div>
+  </div>
+</div>
+
+<div class="header-strip">
+  <div class="col"><h2>How it's built</h2></div>
+</div>
+<div class="content-band">
+  <div class="col">
+    <div class="changed">
+      <span class="changed-tag">New</span>
+      <p><strong>Under the hood.</strong> The Alternate Lead Finder isn't a single program — it's a small pipeline of connected services. Here's the end-to-end flow and the technology behind each step.</p>
+      <div style="overflow-x:auto;margin:0 0 8px 0;">
+      <svg viewBox="0 0 720 392" role="img" aria-label="Architecture diagram of the Alternate Lead Finder pipeline" style="width:100%;height:auto;min-width:520px;border:1px solid #e0e0e0;background:#ffffff;font-family:'Lato',Arial,sans-serif;">
+        <defs>
+          <marker id="ar" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#90a4ae"/></marker>
+          <marker id="ars" markerWidth="9" markerHeight="9" refX="0" refY="3" orient="auto"><path d="M6,0 L0,3 L6,6 Z" fill="#90a4ae"/></marker>
+        </defs>
+        <!-- trigger -->
+        <rect x="210" y="16" width="300" height="54" rx="6" fill="#F2F2F2" stroke="#cfd8dc"/>
+        <text x="360" y="39" text-anchor="middle" font-size="14" font-weight="700" fill="#37474F">n8n · Closed Threads Processing</text>
+        <text x="360" y="57" text-anchor="middle" font-size="11.5" fill="#607d8b">Google Cloud Run · Mon 6:00 AM PHT</text>
+        <line x1="360" y1="70" x2="360" y2="90" stroke="#90a4ae" stroke-width="1.5" marker-end="url(#ar)"/>
+        <!-- queue -->
+        <rect x="210" y="90" width="300" height="54" rx="6" fill="#F2F2F2" stroke="#cfd8dc"/>
+        <text x="360" y="113" text-anchor="middle" font-size="14" font-weight="700" fill="#37474F">Supabase · PostgreSQL</text>
+        <text x="360" y="131" text-anchor="middle" font-size="11.5" fill="#607d8b">closed_sequence_threads (weekly queue)</text>
+        <line x1="360" y1="144" x2="360" y2="166" stroke="#90a4ae" stroke-width="1.5" marker-end="url(#ar)"/>
+        <!-- enrichment (left) -->
+        <rect x="16" y="176" width="152" height="96" rx="6" fill="#ffffff" stroke="#37474F"/>
+        <text x="92" y="196" text-anchor="middle" font-size="11.5" font-weight="700" fill="#37474F">Lookup &amp; dedup</text>
+        <text x="92" y="216" text-anchor="middle" font-size="11" fill="#212121">Hunter.io (primary)</text>
+        <text x="92" y="233" text-anchor="middle" font-size="11" fill="#212121">Apify (fallback)</text>
+        <text x="92" y="250" text-anchor="middle" font-size="11" fill="#212121">OpenAI (company name)</text>
+        <text x="92" y="267" text-anchor="middle" font-size="11" fill="#212121">ActiveCampaign (dedup)</text>
+        <line x1="168" y1="220" x2="180" y2="220" stroke="#90a4ae" stroke-width="1.5" marker-start="url(#ars)" marker-end="url(#ar)"/>
+        <!-- function (hero) -->
+        <rect x="180" y="166" width="360" height="106" rx="8" fill="#37474F"/>
+        <text x="360" y="196" text-anchor="middle" font-size="14.5" font-weight="700" fill="#ffffff">Supabase Edge Function</text>
+        <text x="360" y="216" text-anchor="middle" font-size="12" fill="#cfd8dc">alternate-lead-finder (Deno / TypeScript)</text>
+        <text x="360" y="240" text-anchor="middle" font-size="11" fill="#cfd8dc">reads queue → looks up → de-dups → resolves org → files</text>
+        <text x="360" y="258" text-anchor="middle" font-size="11" fill="#cfd8dc">scheduled by pg_cron · Mon 6:55 AM PHT</text>
+        <!-- spine to distributor -->
+        <line x1="360" y1="272" x2="360" y2="292" stroke="#90a4ae" stroke-width="1.5"/>
+        <line x1="128" y1="292" x2="592" y2="292" stroke="#90a4ae" stroke-width="1.5"/>
+        <line x1="128" y1="292" x2="128" y2="308" stroke="#90a4ae" stroke-width="1.5" marker-end="url(#ar)"/>
+        <line x1="360" y1="292" x2="360" y2="308" stroke="#90a4ae" stroke-width="1.5" marker-end="url(#ar)"/>
+        <line x1="592" y1="292" x2="592" y2="308" stroke="#90a4ae" stroke-width="1.5" marker-end="url(#ar)"/>
+        <!-- outputs -->
+        <rect x="20" y="308" width="216" height="64" rx="6" fill="#F2F2F2" stroke="#cfd8dc"/>
+        <text x="128" y="334" text-anchor="middle" font-size="13" font-weight="700" fill="#37474F">alternate_leads</text>
+        <text x="128" y="352" text-anchor="middle" font-size="11" fill="#607d8b">Supabase Postgres (master)</text>
+        <rect x="252" y="308" width="216" height="64" rx="6" fill="#F2F2F2" stroke="#cfd8dc"/>
+        <text x="360" y="334" text-anchor="middle" font-size="13" font-weight="700" fill="#37474F">Google Sheet</text>
+        <text x="360" y="352" text-anchor="middle" font-size="11" fill="#607d8b">alternate_leads_found tab</text>
+        <rect x="484" y="308" width="216" height="64" rx="6" fill="#F2F2F2" stroke="#cfd8dc"/>
+        <text x="592" y="334" text-anchor="middle" font-size="13" font-weight="700" fill="#37474F">Email preview → Liv</text>
+        <text x="592" y="352" text-anchor="middle" font-size="11" fill="#607d8b">Gmail API</text>
+      </svg>
+      </div>
+      <p class="placeholder-caption">Architecture: n8n queues the week's closed threads; a scheduled Supabase Edge Function enriches and de-duplicates each one, then files the results to the database, the sales sheet, and an email to Liv.</p>
+      <p><strong>The pipeline, step by step:</strong></p>
+      <ol>
+        <li><strong>n8n (on Google Cloud Run).</strong> The upstream "Closed Threads Processing" workflow gathers each week's closed / unresponsive threads and writes them to a queue table.</li>
+        <li><strong>Supabase database (PostgreSQL).</strong> Holds all the working data — the queue of closed leads, the master <code>alternate_leads</code> records, and the cached ActiveCampaign contact list used for de-duplication.</li>
+        <li><strong>Supabase Edge Function.</strong> The finder itself: a small TypeScript / Deno program that reads the queue, looks up contacts, removes duplicates, resolves the company name, then files the results.</li>
+        <li><strong>Scheduling (pg_cron).</strong> Two database cron jobs start the pipeline automatically every Monday — the n8n step at 6:00 AM and the finder at 6:55 AM, Philippine time.</li>
+      </ol>
+      <p><strong>The technology stack:</strong></p>
+      <ul>
+        <li><strong>Supabase</strong> — PostgreSQL database, the Edge Function runtime (Deno / TypeScript), and pg_cron scheduling.</li>
+        <li><strong>n8n on Google Cloud Run</strong> — the upstream weekly trigger.</li>
+        <li><strong>Hunter.io, Apify, and OpenAI</strong> — contact lookup (primary + fallback) and AI company-name enrichment.</li>
+        <li><strong>ActiveCampaign</strong> — the CRM checked so we never add a contact we already have.</li>
+        <li><strong>Google Workspace APIs</strong> — Google Sheets (the sales sheet) and Gmail (the preview email to Liv).</li>
+        <li><strong>Google Cloud Secret Manager &amp; Supabase secrets</strong> — secure storage for the service API keys.</li>
+      </ul>
+    </div>
   </div>
 </div>
 
