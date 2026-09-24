@@ -31,6 +31,15 @@ EDGE FUNCTION
   tab 'alternate_leads_found' (dynamic column mapping) and set is_added_to_sheet=true
   -> email a dynamic HTML preview to Liv.
   Runs work in EdgeRuntime.waitUntil, returns 202.
+  WALL-CLOCK GUARD: the isolate is hard-killed at ~150s and the append-to-sheet + email
+  step runs once AFTER the row loop, so a run that times out mid-loop would insert leads
+  but never flush them to the sheet or email. Before each new provider call (cache
+  misses only), run() checks the time budget and breaks if starting one risks the kill,
+  so the flush always runs; remaining rows stay unprocessed and retry. Reserve is
+  provider-aware (Apify ~1 min/domain, so ~1-2 Apify domains drain per run). Env knobs:
+  WALL_CLOCK_MS (150000), APPEND_RESERVE_MS (15000), HUNTER_CALL_RESERVE_MS (8000),
+  APIFY_CALL_RESERVE_MS (70000). Recover DB-only leads (is_added_to_sheet=false) with
+  ?append=1.
   APIFY FALLBACK: when Hunter's monthly credits are exhausted (HTTP 429, details
   "...limit for the number of searches per billing period...") the run switches
   reactively to the Apify actor scrapersdelight~decision-maker-email-finder (sticky
@@ -42,18 +51,27 @@ EDGE FUNCTION
   Debug query params: ?sync=1 (await + return summary), ?limit=N (cap batch),
   ?inspect=1 (check Sheets/Gmail/AC access, no send), ?append=1 (append+email only),
   ?probe=<domain> (raw Hunter check), ?aprobe=<domain> (raw Apify check),
+  ?orgprobe=<domain> (raw OpenAI org-resolver check, optional &hint=; no writes),
   ?provider=apify (force Apify, skip Hunter), ?fixorg=1 (sync sheet Org column to DB
   by email), ?to=<email> (override email recipient; honoured by ?sync runs too).
-  org is never left null on an alternate lead: when Hunter/Apify return no org, the
-  ORIGINAL lead's org is carried over (looked up by original email across
-  ai_verified_cold_leads/manually_found_cold_leads for cold, and
-  ai_scraped_soc_med_leads/manually_found_leads for soc med).
+  org is never left null on an alternate lead. Resolution order: provider org (Hunter
+  returns one; the Apify actor has NO company field, so on the Apify path org starts
+  null) -> soc-med context org -> carry over the ORIGINAL lead's org by email
+  (loadOrgByEmail, across ai_verified_cold_leads/manually_found_cold_leads for cold and
+  ai_scraped_soc_med_leads/manually_found_leads for soc med) -> OpenAI web-search
+  resolver -> bare domain (absolute last resort). The OpenAI resolver
+  (resolveOrgViaOpenAI) handles leads whose original email is in no detail table (e.g.
+  cold-follow-up rows), using the Responses API + web_search tool so the model looks
+  the domain up (a non-browsing gpt-4o-mini hallucinated org names); cached per domain,
+  fires only when org is otherwise null and a candidate exists. Model via OPENAI_MODEL
+  (default gpt-4o).
   Requires (edge-function secrets, set in Supabase — NOT in the repo):
   SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY (auto-injected), HUNTER_IO_API_KEY,
-  APIFY_API_TOKEN, GOOGLE_SERVICE_ACCOUNT_JSON, AC_API_URL, AC_API_TOKEN. Optional
-  overrides: NOTIFY_TO (default liv@myadventuregroup.com.au), NOTIFY_FROM (default
-  julienne@myadventuregroup.com.au), SALES_SHEET_ID, ALT_LEADS_TAB, APIFY_ACTOR,
-  APIFY_LIMIT, APIFY_MAX_DOMAINS.
+  APIFY_API_TOKEN, OPENAI_API_KEY, GOOGLE_SERVICE_ACCOUNT_JSON, AC_API_URL,
+  AC_API_TOKEN. Optional overrides: NOTIFY_TO (default liv@myadventuregroup.com.au),
+  NOTIFY_FROM (default julienne@myadventuregroup.com.au), SALES_SHEET_ID, ALT_LEADS_TAB,
+  APIFY_ACTOR, APIFY_LIMIT, APIFY_MAX_DOMAINS, OPENAI_MODEL (default gpt-4o),
+  WALL_CLOCK_MS, APPEND_RESERVE_MS, HUNTER_CALL_RESERVE_MS, APIFY_CALL_RESERVE_MS.
 
 EXTERNAL INTEGRATIONS
 - Hunter.io (api.hunter.io/v2/domain-search) — REST, key in Supabase secret
@@ -64,6 +82,11 @@ EXTERNAL INTEGRATIONS
   only when Hunter is out of credits. Actor scrapersdelight~decision-maker-email-finder
   (Starter plan, pay-per-event); scrapes company site + LinkedIn, covers AU. Verified
   live: infrabuild.com.au -> "Tracey Sen, Head of Communication APAC".
+- OpenAI (api.openai.com/v1/responses, web_search tool) — REST, key in Supabase secret
+  OPENAI_API_KEY and GCP Secret Manager (OPENAI_API_KEY). Last-resort org resolver only:
+  identifies a company name from its domain when no provider/DB org is available. Model
+  OPENAI_MODEL (default gpt-4o); must support web_search. Verified: hia.com.au ->
+  "Housing Industry Association", avmc.com.au -> "Adelaide Venue Management Corporation".
 - Google Sheets + Gmail — Sheets/Gmail REST APIs via service account
   insta-drive-uploader@claudegwscli-502400.iam.gserviceaccount.com (client id
   112006793372164249856), key in Supabase secret GOOGLE_SERVICE_ACCOUNT_JSON.
@@ -109,5 +132,7 @@ GCP
 - Project claudegwscli-502400. Secret Manager: hunter-io-api-key,
   supabase-access-token, and apify-api-token, each granted
   roles/secretmanager.secretAccessor to the compute SA
-  659687081407-compute@developer.gserviceaccount.com.
+  659687081407-compute@developer.gserviceaccount.com. OPENAI_API_KEY is also stored
+  here (read once and copied into the Supabase function secrets — the edge function
+  reads it from Supabase, not GCP).
 ================================================================================

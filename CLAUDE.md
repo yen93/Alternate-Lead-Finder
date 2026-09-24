@@ -22,6 +22,7 @@ pg_cron jobs.
 - Debug params: `?sync=1`, `?limit=N`, `?inspect=1` (check Sheets/Gmail/AC access,
   no send), `?append=1` (only the append+email step, no Hunter cost), `?probe=<domain>`
   (raw Hunter check), `?aprobe=<domain>` (raw Apify fallback check),
+  `?orgprobe=<domain>` (raw OpenAI org-resolver check, optional `&hint=<text>`; no writes),
   `?provider=apify` (force the Apify fallback, skipping Hunter — for testing),
   `?fixorg=1` (maintenance: sync the sheet's Org column to the DB, matching rows by
   email — fills blanks/drift, no sends),
@@ -54,6 +55,18 @@ pg_cron jobs.
   company's OWN site + LinkedIn (geography-agnostic — it covers `.com.au`, unlike the
   Apollo/US-DB actors which returned 0 for AU domains). Per-run cap `APIFY_MAX_DOMAINS`
   (default 80); env knobs `APIFY_ACTOR`, `APIFY_LIMIT`.
+- **Wall-clock guard (append+email must always run).** The isolate is hard-killed at
+  ~150s and the append-to-sheet + email step runs ONCE, after the row loop — so a run
+  that times out mid-loop inserts leads into the DB but never flushes them to the sheet
+  or emails (this actually happened: 2 leads inserted, nothing appended). The Apify
+  fallback is ~1 min/domain, so a 20-row Apify run can't finish in 150s. Fix: before
+  each *new* provider call (cache misses only), `run()` checks the time budget and, if
+  starting one risks the kill, `break`s so the flush still runs; remaining rows stay
+  unprocessed and retry. Reserve is provider-aware. Env knobs: `WALL_CLOCK_MS` (150000),
+  `APPEND_RESERVE_MS` (15000), `HUNTER_CALL_RESERVE_MS` (8000), `APIFY_CALL_RESERVE_MS`
+  (70000). Consequence: while Hunter is exhausted, only ~1–2 Apify domains drain per
+  run — the backlog clears slowly until Hunter resets. Recover DB-only leads (inserted
+  but not on the sheet, `is_added_to_sheet=false`) with `?append=1`.
 - **Only mark a row processed when a real lead was inserted.** `is_processed` is set
   true for a `closed_sequence_threads` row ONLY when ≥1 `alternate_leads` row (with an
   email) was actually inserted for it — for BOTH Hunter and Apify. Provider errors,
@@ -63,18 +76,32 @@ pg_cron jobs.
   is ever burned without a lead.)
 - **`closed_sequence_threads` has no `source_type_id`** (it's on the follow-up
   tables). Pull carried context from the source table, not the closed table.
-- **`alternate_leads.org` must never be null.** If Hunter/Apify return no org, carry
-  over the ORIGINAL lead's org, looked up by the original email (`loadOrgByEmail`)
-  across the cold detail tables (`ai_verified_cold_leads`, `manually_found_cold_leads`)
-  and the soc-med detail tables (`ai_scraped_soc_med_leads`, `manually_found_leads`) —
-  all of which have `email` + `org`. Use `?fixorg=1` to backfill the sheet's Org column.
+- **`alternate_leads.org` must never be null.** Resolution order (`run()` per row):
+  provider org (Hunter returns one; **the Apify actor does NOT — it has no company
+  field**, so on the Apify path org always starts null) → soc-med context org →
+  carry over the ORIGINAL lead's org by email (`loadOrgByEmail`, across the cold
+  detail tables `ai_verified_cold_leads`/`manually_found_cold_leads` and the soc-med
+  detail tables `ai_scraped_soc_med_leads`/`manually_found_leads`) → **OpenAI
+  web-search resolver** → bare domain (absolute last resort, so never null).
+- **OpenAI org resolver (`resolveOrgViaOpenAI`):** last resort when a lead's original
+  email isn't in any detail table (e.g. cold-follow-up rows whose lead was never in
+  the cold detail tables — carry-over then finds nothing). Uses the **Responses API
+  with the `web_search` tool** so the model actually looks the domain up — a plain
+  non-browsing model (`gpt-4o-mini`) HALLUCINATED (called hia.com.au the "Health
+  Insurance Association"; it's the Housing Industry Association), so a web-search model
+  is required. Model via `OPENAI_MODEL` (default `gpt-4o`; must support
+  `web_search_preview`). Cached per domain per run; only fires when org is otherwise
+  null AND there's a candidate to insert. Test with `?orgprobe=<domain>`; backfill the
+  sheet's Org column with `?fixorg=1`.
 - **pg_cron is UTC-only.** Mon PHT = Sunday UTC (`dow 0`, not 1). 6:00 AM PHT =
   `0 22 * * 0`; 6:55 AM PHT = `55 22 * * 0`.
 - **Secrets:** the Management API `GET /secrets` returns only hashed digests, so you
   can't read values back. Set them with `POST /secrets`. The edge function reads its
   keys from **Supabase function secrets** (HUNTER_IO_API_KEY, APIFY_API_TOKEN,
-  GOOGLE_SERVICE_ACCOUNT_JSON, AC_API_URL, AC_API_TOKEN, ...), which are SEPARATE from
-  GCP Secret Manager.
+  OPENAI_API_KEY, GOOGLE_SERVICE_ACCOUNT_JSON, AC_API_URL, AC_API_TOKEN, ...), which are
+  SEPARATE from GCP Secret Manager. `OPENAI_API_KEY` lives in GCP Secret Manager
+  (`OPENAI_API_KEY`, project `claudegwscli-502400`) and was copied into the Supabase
+  function secrets from there.
 - **Google auth:** SA = `insta-drive-uploader@claudegwscli-502400.iam.gserviceaccount.com`
   (client id 112006793372164249856). Sheets needs the sheet shared with the SA;
   Gmail send needs Workspace domain-wide delegation for scope `.../auth/gmail.send`
