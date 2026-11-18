@@ -1,0 +1,184 @@
+================================================================================
+CHAT HISTORY EXPORT — 2026-11-18
+Session: Diagnosed why the Alternate Lead Finder had stopped adding leads (Hunter
+key 401), then rebuilt the edge function around the Apify DeepMine LinkedIn
+company-employees actor (target-role people, names + titles only, no emails), added
+a failed_apify_search flag, a hard 20-row cap and parallel per-company searches, and
+verified it with live full runs. Also tested the Lusha V3 key and updated CLAUDE.md.
+================================================================================
+
+NOTE ON REDACTIONS: No live secret VALUES were exposed this session. API keys/tokens
+(Supabase management token, Apify token, Lusha key) were read from their gitignored
+local files via shell variables and only used in request headers; none was printed.
+The n8n webhook URLs/UUIDs that appeared in the user's message and in cron.job output
+are shown here as [REDACTED_N8N_WEBHOOK_ID] since they act as capability URLs.
+
+--------------------------------------------------------------------------------
+USER:
+Ran `SELECT * FROM process_unresponsive_lead('1a17f7c4d90ca6c6')` and asked why that
+thread did not get added to alternate_leads.
+
+--------------------------------------------------------------------------------
+ASSISTANT:
+Read the function definition and rows (read-only). process_unresponsive_lead ONLY
+inserts into closed_sequence_threads (ON CONFLICT DO NOTHING) — it never writes
+alternate_leads. The thread was inserted as closed_sequence_threads id 355
+(michael.biercuk@salus.vc, is_processed null) and is queued for the weekly
+alternate-lead-finder run (Mon 6:55 AM PHT). Noted that this same email was already
+an alternate lead (alternate_leads id 45), so a Salus search could dedupe everyone
+away. Did not run the finder (spends credits, writes sheet, emails Liv).
+
+--------------------------------------------------------------------------------
+USER / ASSISTANT (short Q&A):
+Asked whether the edge function updates is_added_to_sheet -> yes: appendToSheetAndNotify
+selects null/false rows, appends to the Google Sheet, then sets is_added_to_sheet=true
+(only after the append succeeds; a failed flag-update would cause duplicate appends).
+Asked whether it appends to the sheet -> yes (index.ts ~765-796). User then said an
+n8n workflow also appends to a sheet; assistant held its ground on the code, noted the
+n8n workflow is separate and may target a different sheet, offered to read its JSON.
+Asked if that n8n webhook ([REDACTED_N8N_WEBHOOK_ID]) is scheduled in the DB -> checked
+cron.job in both projects: not scheduled (the closest job is
+n8n-closed-threads-processing, jobid 33, '0 22 * * 0', a different webhook).
+Asked (via /q, read-only) to confirm the flow -> n8n (via process_unresponsive_lead)
+fills closed_sequence_threads; the weekly edge function reads unprocessed rows and
+fills alternate_leads.
+
+--------------------------------------------------------------------------------
+USER:
+Pasted a query showing many unprocessed rows and asked why the last sheet row was
+still Nov 8.
+
+--------------------------------------------------------------------------------
+ASSISTANT:
+Found 243 pending rows, last alternate_leads insert 2026-11-08 22:56 UTC, no unsheeted
+rows. cron job 3 fired on schedule on Nov 15 22:55 UTC, but the function logs showed
+every Hunter call returned 401 authentication_failed ("No user found for the API key
+supplied") -> "Inserted 0 alternate lead(s)". Root cause: invalid Hunter key. Apify
+fallback didn't trigger because it only switched on the 429 quota signal.
+
+--------------------------------------------------------------------------------
+USER:
+Make it fall back to Apify on 401, then deploy it, then test limit=1.
+
+--------------------------------------------------------------------------------
+ASSISTANT:
+Edited hunterDomainSearch so 401 returns "exhausted" (-> Apify fallback). Deployed
+(v52) and ran ?sync=1&limit=1 with the email redirected to the user: logs confirmed
+the 401 -> Apify switch, but the old Apify actor returned nothing for amca.com.au.
+
+--------------------------------------------------------------------------------
+USER:
+Asked to test the Lusha key (44 free credits now) with one lookup.
+
+--------------------------------------------------------------------------------
+ASSISTANT:
+V2 endpoints returned HTTP 410 ("migrate to V3"; V2 sunset 2026-11-30). A web-fetch
+subagent read the V3 docs (base https://api.lusha.com, header api_key, GET
+/v3/account/usage free, POST /v3/contacts/prospecting). Usage call: key valid, 44/44
+credits, free plan. One prospecting search for amca.com.au returned the CEO (1 credit
+charged; email needs a separate 1-credit reveal). Lusha not wired in.
+
+--------------------------------------------------------------------------------
+USER:
+Asked whether there is an Apify actor that just finds names of people at a company
+(emails optional), then asked to test on amca.com.au (name + position only).
+
+--------------------------------------------------------------------------------
+ASSISTANT:
+Web search found several LinkedIn "company employees" actors. Read public input
+schemas via the Apify API and ran deepmine~linkedin-company-employees for "AMCA
+Australia": 8 people, only ~3 usable (false matches, taglines as titles). User then
+supplied six target roles (Conference/Events Manager, Marketing Manager,
+Communication Manager, L&D Manager, People & Culture Manager, Executive Assistant).
+Tested on Housing Industry Association: one broad 50-person pull + keyword filter kept
+2/50; the actor's `title` filter (single exact phrase) returned 0-1 for every phrase.
+Recommended broad pull + code-side filtering.
+
+--------------------------------------------------------------------------------
+USER:
+"Apply Filtering reco. We now only use the DeepMine actor. No Hunter. No Lusha."
+
+--------------------------------------------------------------------------------
+ASSISTANT:
+Rewrote index.ts (spliced by line range, verified with a tsc syntax check — no Deno
+installed): DeepMine as the only provider (pull up to 100 people per company, filter
+to target-role regexes in code), org resolved BEFORE the search (DeepMine searches by
+company name), leads inserted with email NULL, dedupe by name+org / name+email-domain,
+exclude the unresponsive lead themself, mark processed when >=1 lead inserted, ?probe
+now probes DeepMine. Flagged risks: n8n mailers with null emails (unchecked), NOT IN
+queries breaking on NULL, no AC dedup. Role regexes validated on saved data (e.g.
+"Prevention Manager" does not match "event").
+
+--------------------------------------------------------------------------------
+USER:
+Make it process only 20 rows max per run -> then "deploy it and test with limit=1".
+
+--------------------------------------------------------------------------------
+ASSISTANT:
+Made 20 a hard cap (MAX_ROWS_PER_RUN; ?limit can only lower it). Deployed (v53). Test
+on row 58 (amca.com.au) inserted nothing: OpenAI resolved the org to the long legal
+name which DeepMine returns 0 people for ("AMCA Australia" returns 7, none in target
+roles).
+
+--------------------------------------------------------------------------------
+USER:
+"Yes make the prompt fix and redeploy" -> changed the OpenAI org prompt to ask for the
+common/LinkedIn trading name (v54; orgprobe now returns "AMCA Australia"). Then
+"rerun" (AMCA still no target-role match). Then asked for a closest-person fallback;
+it was added and deployed (v55; AMCA -> CEO picked) and then REVERSED by the user:
+"forget the closest person fallback. We only get people within the specified roles."
+
+--------------------------------------------------------------------------------
+USER:
+Add column failed_apify_search (boolean) to closed_sequence_threads: true if the
+search returned no matching lead, false if processed successfully with a matching lead.
+
+--------------------------------------------------------------------------------
+ASSISTANT:
+Applied migration (nullable boolean + column comment). Removed the fallback; run() now
+sets is_processed=true+failed=false on success, failed=true on a successful search
+with no matching lead, and leaves it null on provider errors. Chose (and flagged) to
+exclude failed=true rows from the queue so they don't hog the 20-row window. Deployed
+v56 and tested limit=1: row 58 flagged true. User then asked that failed rows be
+excluded from the queue (already implemented) and that other rows for the same company
+also be flagged true -> added markCompanyFailed (same email domain, only when the
+company has no target-role people at all). Deployed v57; a full run processed row 59
+(Sydney Uni Sport: 4 leads) and flagged AMCA rows 63/112/166 via the sibling logic; but
+only 2 companies fit in the wall clock (~35s per DeepMine search).
+
+--------------------------------------------------------------------------------
+USER:
+"Batch all companies in one call."
+
+--------------------------------------------------------------------------------
+ASSISTANT:
+Tested a real 3-company batch: 125s — the actor works through companies serially, and
+results carry `searchQuery` = the input company. 20 companies in one call (~13 min)
+can't fit the ~150s isolate. Asked; user chose parallel per-company calls. Rewrote
+run() with a pre-pass: group rows by domain, resolve orgs (OpenAI, parallel), one
+DeepMine search per company in parallel (DEEPMINE_CONCURRENCY 20), then the per-row
+loop reads the cache. Deployed v58 + full run (email redirected): 18 companies in 78s,
+90s total, 11 rows processed, 26 leads inserted and appended; 24 flagged, 227 pending.
+Noted quality issues (headline-driven false matches like "Retired").
+
+--------------------------------------------------------------------------------
+USER:
+"Yes, match job title only and update CLAUDE.md."
+
+--------------------------------------------------------------------------------
+ASSISTANT:
+isTargetRole now matches job title only; rewrote CLAUDE.md for the new design
+(providers history, run flow, flags, gotchas, env knobs, null-email caveats). User:
+"deploy it and test with full run" -> deployed v59; full run: 87s, 16 companies, 12 of
+20 rows processed, 39 leads inserted/appended, preview emailed only to the user. Total
+state: 24 processed ok, 39 flagged failed, 200 pending. Remaining false positives
+noted (company name as title e.g. Quest Events, "event labourer", US executives).
+Offered a role-word requirement / title-vs-company-name filter; not yet applied.
+
+--------------------------------------------------------------------------------
+USER:
+/dcp — save chat, update as_built.txt / CLAUDE.md / .gitignore (no git).
+
+================================================================================
+END OF EXPORT
+================================================================================

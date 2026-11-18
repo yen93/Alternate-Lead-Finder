@@ -1,13 +1,15 @@
 ================================================================================
 AS-BUILT — Alternate Lead Finder
-Last updated: 2026-09-24
+Last updated: 2026-11-18
 ================================================================================
 
 OVERVIEW
 Weekly automation that, for each closed/unresponsive lead in
-closed_sequence_threads, finds a DIFFERENT contact at the same company (via
-Hunter.io), dedups against ActiveCampaign, records it in alternate_leads,
-appends it to the sales Google Sheet, and emails Liv a preview.
+closed_sequence_threads, finds DIFFERENT people at the same company who hold one of
+the target POC roles (names + job titles only — NO emails — via the Apify actor
+deepmine~linkedin-company-employees), records them in alternate_leads (email NULL),
+appends them to the sales Google Sheet, and emails Liv a preview.
+Hunter.io, the older Apify email-finder actor and Lusha are NOT used any more.
 
 SUPABASE PROJECTS (org zakkhdjcwkgxjppsjnyi)
 - aivitcomiywiysrfwqxt (MAGTestProject, ap-northeast-1) — all business tables,
@@ -17,76 +19,66 @@ SUPABASE PROJECTS (org zakkhdjcwkgxjppsjnyi)
 
 EDGE FUNCTION
 - supabase/functions/alternate-lead-finder/index.ts — Deno + @supabase/supabase-js
-  (service role), verify_jwt=false. Deployed to project aivitcomiywiysrfwqxt.
-  URL: https://aivitcomiywiysrfwqxt.supabase.co/functions/v1/alternate-lead-finder
-  Flow: query unprocessed closed_sequence_threads (email not null; capped at 20 rows
-  per run by default, ?limit=N overrides) -> Hunter.io
-  domain-search per company (limit=10, the Free-plan max) -> prioritise target POC
-  roles (<=5) else 1 fallback -> exclude emails already in AC (cached table, or
-  live AC API when the table is empty) -> insert into alternate_leads (lead_type
-  'soc med' for follow_up_sequence_threads source, else 'cold'; carry speaker/event
-  for soc med) -> mark a source row is_processed=true ONLY when >=1 alternate lead
-  (with an email) was actually inserted for it (Hunter AND Apify alike; empty/errored/
-  all-deduped rows stay unprocessed and retry) -> append new leads to the sales sheet
-  tab 'alternate_leads_found' (dynamic column mapping) and set is_added_to_sheet=true
-  -> email a dynamic HTML preview to Liv.
+  (service role), verify_jwt=false. Deployed to project aivitcomiywiysrfwqxt
+  (currently version 59). URL:
+  https://aivitcomiywiysrfwqxt.supabase.co/functions/v1/alternate-lead-finder
+  Flow:
+  1. Queue: up to 20 rows (MAX_ROWS_PER_RUN, hard cap; ?limit=N can only lower it) from
+     closed_sequence_threads where email is not null AND is_processed is null/false AND
+     failed_apify_search is NOT true, oldest id first.
+  2. Pre-pass (parallel): group rows by email domain -> one company per domain. Resolve
+     the company NAME: soc-med context org -> the original lead's org by email
+     (loadOrgByEmail over ai_verified_cold_leads / manually_found_cold_leads /
+     ai_scraped_soc_med_leads / manually_found_leads) -> OpenAI web-search resolver
+     (asks for the common/LinkedIn trading name) -> bare domain. Then ONE DeepMine search
+     per company, all in parallel (DEEPMINE_CONCURRENCY=20, maxResults 100,
+     enrichProfiles=false). Measured: 18 companies in 78s (~90s per full run).
+  3. Per row: pick up to 5 people whose JOB TITLE matches TARGET_ROLE_PATTERNS
+     (word-boundary regexes: event(s), conference(s), marketing, communication(s),
+     learning & development / L&D, people & culture, executive assistant). No fallback.
+     Exclude the unresponsive lead themself (name vs original email) and people already
+     in alternate_leads (dedup by name+org and name+email-domain). Insert into
+     alternate_leads with email NULL (lead_type 'soc med' for follow_up_sequence_threads
+     source, else 'cold'; carry speaker/event/subject for soc med).
+  4. Flags on closed_sequence_threads: lead inserted -> is_processed=true,
+     failed_apify_search=false. Search ran but no matching lead -> failed_apify_search=true
+     (row is then skipped by the queue; set to null to retry). If the company has NO
+     target-role people at all, all other unprocessed rows for the same email domain are
+     also flagged true (markCompanyFailed). Provider error / no token / cap / wall-clock
+     skip -> flag stays null and the row retries.
+  5. Flush: append all is_added_to_sheet=false/null leads to the sheet tab
+     'alternate_leads_found' (dynamic column mapping), set is_added_to_sheet=true, email a
+     dynamic HTML preview to Liv (a lead with no email shows "—").
   Runs work in EdgeRuntime.waitUntil, returns 202.
-  WALL-CLOCK GUARD: the isolate is hard-killed at ~150s and the append-to-sheet + email
-  step runs once AFTER the row loop, so a run that times out mid-loop would insert leads
-  but never flush them to the sheet or email. Before each new provider call (cache
-  misses only), run() checks the time budget and breaks if starting one risks the kill,
-  so the flush always runs; remaining rows stay unprocessed and retry. Reserve is
-  provider-aware (Apify ~1 min/domain, so ~1-2 Apify domains drain per run). Env knobs:
-  WALL_CLOCK_MS (150000), APPEND_RESERVE_MS (15000), HUNTER_CALL_RESERVE_MS (8000),
-  APIFY_CALL_RESERVE_MS (70000). Recover DB-only leads (is_added_to_sheet=false) with
-  ?append=1.
-  APIFY FALLBACK: when Hunter's monthly credits are exhausted (HTTP 429, details
-  "...limit for the number of searches per billing period...") the run switches
-  reactively to the Apify actor scrapersdelight~decision-maker-email-finder (sticky
-  for the rest of the run), which scrapes each company's own site + LinkedIn and
-  returns name/title/best-guess email/pattern/confidence/MX; records are mapped into
-  the Hunter shape so the rest of the pipeline is unchanged. Chosen because US-DB
-  actors (scalelist, dev00) returned 0 for .com.au domains. Per-run cap
-  APIFY_MAX_DOMAINS (default 80).
-  Debug query params: ?sync=1 (await + return summary), ?limit=N (cap batch),
-  ?inspect=1 (check Sheets/Gmail/AC access, no send), ?append=1 (append+email only),
-  ?probe=<domain> (raw Hunter check), ?aprobe=<domain> (raw Apify check),
-  ?orgprobe=<domain> (raw OpenAI org-resolver check, optional &hint=; no writes),
-  ?provider=apify (force Apify, skip Hunter), ?fixorg=1 (sync sheet Org column to DB
-  by email), ?to=<email> (override email recipient; honoured by ?sync runs too).
-  org is never left null on an alternate lead. Resolution order: provider org (Hunter
-  returns one; the Apify actor has NO company field, so on the Apify path org starts
-  null) -> soc-med context org -> carry over the ORIGINAL lead's org by email
-  (loadOrgByEmail, across ai_verified_cold_leads/manually_found_cold_leads for cold and
-  ai_scraped_soc_med_leads/manually_found_leads for soc med) -> OpenAI web-search
-  resolver -> bare domain (absolute last resort). The OpenAI resolver
-  (resolveOrgViaOpenAI) handles leads whose original email is in no detail table (e.g.
-  cold-follow-up rows), using the Responses API + web_search tool so the model looks
-  the domain up (a non-browsing gpt-4o-mini hallucinated org names); cached per domain,
-  fires only when org is otherwise null and a candidate exists. Model via OPENAI_MODEL
-  (default gpt-4o).
+  WALL-CLOCK GUARD: isolate is hard-killed at ~150s; searches only start while
+  elapsed < WALL_CLOCK_MS - APPEND_RESERVE_MS - APIFY_CALL_RESERVE_MS; skipped ones retry.
+  Recover DB-only leads (is_added_to_sheet=false) with ?append=1.
+  Debug query params: ?sync=1 (await + return summary), ?limit=N, ?inspect=1 (check
+  Sheets/Gmail/AC access, no send), ?append=1 (append+email only), ?probe=<company or
+  domain> (alias ?aprobe=; raw DeepMine search, no writes — shows people returned, target
+  matches, picker output), ?orgprobe=<domain> (OpenAI org resolver, optional &hint=),
+  ?fixorg=1 (sync sheet Org column to DB by email; skips email-less leads),
+  ?to=<email> (override email recipient; ALWAYS use when testing).
   Requires (edge-function secrets, set in Supabase — NOT in the repo):
-  SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY (auto-injected), HUNTER_IO_API_KEY,
-  APIFY_API_TOKEN, OPENAI_API_KEY, GOOGLE_SERVICE_ACCOUNT_JSON, AC_API_URL,
-  AC_API_TOKEN. Optional overrides: NOTIFY_TO (default liv@myadventuregroup.com.au),
-  NOTIFY_FROM (default julienne@myadventuregroup.com.au), SALES_SHEET_ID, ALT_LEADS_TAB,
-  APIFY_ACTOR, APIFY_LIMIT, APIFY_MAX_DOMAINS, OPENAI_MODEL (default gpt-4o),
-  WALL_CLOCK_MS, APPEND_RESERVE_MS, HUNTER_CALL_RESERVE_MS, APIFY_CALL_RESERVE_MS.
+  SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY (auto-injected), APIFY_API_TOKEN,
+  OPENAI_API_KEY, GOOGLE_SERVICE_ACCOUNT_JSON. (AC_API_URL / AC_API_TOKEN and
+  HUNTER_IO_API_KEY are still set but unused by the current flow.) Optional overrides:
+  NOTIFY_TO (default liv@myadventuregroup.com.au), NOTIFY_FROM (default
+  julienne@myadventuregroup.com.au), SALES_SHEET_ID, ALT_LEADS_TAB, APIFY_ACTOR (default
+  deepmine~linkedin-company-employees), DEEPMINE_MAX_RESULTS (100), DEEPMINE_TIMEOUT_S
+  (90), DEEPMINE_CONCURRENCY (20), APIFY_MAX_DOMAINS (80), OPENAI_MODEL (default gpt-4o),
+  WALL_CLOCK_MS (150000), APPEND_RESERVE_MS (15000), APIFY_CALL_RESERVE_MS (75000).
 
 EXTERNAL INTEGRATIONS
-- Hunter.io (api.hunter.io/v2/domain-search) — REST, key in Supabase secret
-  HUNTER_IO_API_KEY and in GCP Secret Manager (hunter-io-api-key). FREE PLAN:
-  ~50 domain searches/month, limit param must be <=10. Primary provider.
 - Apify (api.apify.com run-sync-get-dataset-items) — REST, token in Supabase secret
-  APIFY_API_TOKEN and GCP Secret Manager (apify-api-token). Reactive fallback used
-  only when Hunter is out of credits. Actor scrapersdelight~decision-maker-email-finder
-  (Starter plan, pay-per-event); scrapes company site + LinkedIn, covers AU. Verified
-  live: infrabuild.com.au -> "Tracey Sen, Head of Communication APAC".
+  APIFY_API_TOKEN and GCP Secret Manager (apify-api-token); local file
+  apify_api_token.txt (gitignored). Actor deepmine~linkedin-company-employees: searches
+  public LinkedIn by company NAME (no cookies), returns firstName/lastName/jobTitle/
+  headline/searchQuery; ~35-40s per company; ~$0.79 per 1,000 employees returned;
+  partial coverage (~0-3 target-role people per company).
 - OpenAI (api.openai.com/v1/responses, web_search tool) — REST, key in Supabase secret
-  OPENAI_API_KEY and GCP Secret Manager (OPENAI_API_KEY). Last-resort org resolver only:
-  identifies a company name from its domain when no provider/DB org is available. Model
-  OPENAI_MODEL (default gpt-4o); must support web_search. Verified: hia.com.au ->
-  "Housing Industry Association", avmc.com.au -> "Adelaide Venue Management Corporation".
+  OPENAI_API_KEY and GCP Secret Manager (OPENAI_API_KEY). Org resolver: company's common
+  trading name from its domain (e.g. amca.com.au -> "AMCA Australia").
 - Google Sheets + Gmail — Sheets/Gmail REST APIs via service account
   insta-drive-uploader@claudegwscli-502400.iam.gserviceaccount.com (client id
   112006793372164249856), key in Supabase secret GOOGLE_SERVICE_ACCOUNT_JSON.
@@ -94,39 +86,53 @@ EXTERNAL INTEGRATIONS
   Workspace domain-wide delegation for scope .../auth/gmail.send (sends as
   NOTIFY_FROM). Sheet: docs.google.com/spreadsheets/d/
   1svksxHmNBUx9Z20t2kbtHAT1fThcfdCmz5dEp936L7I (tab 'alternate_leads_found').
-- ActiveCampaign — REST (api/3/contacts), AC_API_URL + AC_API_TOKEN Supabase
-  secrets. Used only as a live fallback when the activecampaign_contacts table
-  is empty.
-- n8n "Closed Threads Processing" (Cloud Run webhook 8fe86e56-7c2f-45cd-9658-
-  ab653f9f2559) — populates closed_sequence_threads weekly (built separately).
+- n8n "Closed Threads Processing" (Cloud Run webhook; id in
+  n8n_google_cloud_run_deployment/schedule_webhooks.sql) — populates
+  closed_sequence_threads weekly via the SQL function process_unresponsive_lead(thread_id)
+  (built separately).
+- Hunter.io — NO LONGER USED (key returned 401 on 2026-11-15; removed from the function).
+- Lusha — NOT USED. Key works on the V3 API only (V2 returns 410; V2 sunset 2026-11-30);
+  free plan 44 credits; tested once, not wired in. Key in lusha_api_key.txt (gitignored),
+  not stored in GCP Secret Manager.
 
 DATA STORES (project aivitcomiywiysrfwqxt)
 - alternate_leads — master record of alternate leads found. Columns = union of
   closed_sequence_threads + follow_up_sequence_threads (deduped) plus lead_type,
-  org, event, poc_lastname, poc_role, is_added_to_sheet. Own bigserial PK, RLS on,
-  indexes on lower(email) and is_added_to_sheet.
+  org, event, poc_lastname, poc_role, is_added_to_sheet. email is NULLABLE and is NULL for
+  DeepMine leads. Own bigserial PK, RLS on.
 - closed_sequence_threads — input; source_table in {cold_leads_follow_up_sequence_
-  threads, follow_up_sequence_threads, bounced}. Rows flagged is_processed=true
-  once handled.
-- activecampaign_contacts (~15k, refreshed daily), follow_up_sequence_threads,
-  cold_leads_follow_up_sequence_threads, ai_scraped_soc_med_leads — read for dedup
-  and to carry speaker/event/context.
+  threads, follow_up_sequence_threads, bounced}. Flags: is_processed (true once a lead was
+  inserted) and failed_apify_search boolean (added 2026-11-18: true = search ran, no
+  matching lead; false = processed with a matching lead; null = not searched / provider
+  error). As of the 2026-11-18 test runs: 24 processed ok, 39 flagged failed, ~200 pending.
+- follow_up_sequence_threads, cold_leads_follow_up_sequence_threads,
+  ai_scraped_soc_med_leads, ai_verified_cold_leads, manually_found_cold_leads,
+  manually_found_leads — read to carry speaker/event/context and the original lead's org.
+- activecampaign_contacts (~15k) — no longer used for dedup (leads have no email).
 
 AUTOMATIONS / ROUTINES (pg_cron; UTC-only, Sun UTC = Mon PHT)
-- alternate-lead-finder-weekly (project aivitcomiywiysrfwqxt) — '55 22 * * 0' =
+- alternate-lead-finder-weekly (project aivitcomiywiysrfwqxt, jobid 3) — '55 22 * * 0' =
   Mon 6:55 AM PHT. net.http_post to the edge function URL with the anon key.
-- n8n-closed-threads-processing (project uwsncuowtzydylfabikj) — '0 22 * * 0' =
-  Mon 6:00 AM PHT. net.http_get to the n8n webhook. Also recorded in the
-  n8n_google_cloud_run_deployment/schedule_webhooks.sql repo.
+- n8n-closed-threads-processing (project uwsncuowtzydylfabikj, jobid 33) — '0 22 * * 0' =
+  Mon 6:00 AM PHT. net.http_get to the n8n webhook.
+
+OPEN ITEMS / KNOWN RISKS
+- Verify the n8n batch-mailer-...-alternate-... workflows skip alternate_leads rows with
+  NULL email.
+- Queries of the form "email not in (select email from alternate_leads)" return no rows
+  once any email is NULL (NOT IN + NULL) — use NOT EXISTS.
+- Some false-positive leads from title matching (company name as title, "event labourer",
+  non-AU executives); optional role-word requirement not yet applied.
+- alternate-lead-finder.html (iMAG user guide) still describes the old Hunter flow.
 
 LOCAL FILES
 - manual_invoke.txt — cmd.exe curl commands to invoke the function on demand
   (contains the public anon key only).
-- alternate-lead-finder.html — iMAG-themed end-user guide for the automation.
+- alternate-lead-finder.html — iMAG-themed end-user guide (out of date).
 - initial_prompt.txt — the original brief.
-- hunter_io_api_key.txt, supabase_access_token.txt, apify_api_token.txt — LIVE
-  SECRETS, gitignored (never committed). Also stored in GCP Secret Manager.
-  (lusha_api_key.txt is gitignored too but Lusha was dropped — unused/unstored.)
+- hunter_io_api_key.txt, supabase_access_token.txt, apify_api_token.txt,
+  lusha_api_key.txt — LIVE SECRETS, gitignored (never committed). The first three are
+  also in GCP Secret Manager.
 
 GCP
 - Project claudegwscli-502400. Secret Manager: hunter-io-api-key,

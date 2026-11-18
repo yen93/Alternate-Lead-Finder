@@ -1,15 +1,15 @@
 // alternate-lead-finder
 // Weekly (Mon 6:55 AM PHT) automation. For each unresponsive lead in
-// closed_sequence_threads, find a DIFFERENT contact at the same org via
-// Hunter.io (prioritising target POC roles), dedup against ActiveCampaign
-// (cached table, with live AC API fallback when the table is empty), record it
-// in alternate_leads, mark the source row processed, append the new leads to the
-// sales Google Sheet (Sheets API via the service account), and email a dynamic
-// preview to Liv (Gmail API via SA domain-wide delegation).
+// closed_sequence_threads, find DIFFERENT people at the same org via the Apify actor
+// deepmine/linkedin-company-employees (names + job titles only - NO emails), keep only
+// the target POC roles, record them in alternate_leads (email is NULL), mark the
+// source row processed, append the new leads to the sales Google Sheet (Sheets API
+// via the service account), and email a dynamic preview to Liv (Gmail API via SA
+// domain-wide delegation).
 //
 // Triggered by pg_cron (net.http_post). Kicks the real work into a background
 // task and returns 202 immediately so it never hits the request timeout.
-// Debug params: ?sync=1, ?limit=N, ?inspect=1, ?probe=<domain>.
+// Debug params: ?sync=1, ?limit=N, ?inspect=1, ?probe=<company name or domain>.
 
 import { createClient, SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2.45.4";
 
@@ -18,19 +18,20 @@ declare const EdgeRuntime: { waitUntil(p: Promise<unknown>): void } | undefined;
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
-const HUNTER_API_KEY = Deno.env.get("HUNTER_IO_API_KEY") ?? "";
 const GOOGLE_SA_JSON = Deno.env.get("GOOGLE_SERVICE_ACCOUNT_JSON") ?? "";
 const AC_API_URL = (Deno.env.get("AC_API_URL") ?? "").replace(/\/+$/, "");
 const AC_API_TOKEN = Deno.env.get("AC_API_TOKEN") ?? "";
 
-// Apify fallback (used only when Hunter's plan credits are exhausted). Actor
-// scrapersdelight/decision-maker-email-finder scrapes the company's OWN site +
-// LinkedIn (geography-agnostic, like Hunter) and returns decision-maker records
-// with name, title, best-guess work email, pattern, confidence and MX validation.
-// API slug uses `~` in the run URL path.
+// DeepMine (Apify) is the ONLY contact provider. Actor deepmine/linkedin-company-employees
+// searches public LinkedIn by company NAME (not domain) and returns people with a job
+// title + headline - no emails. We pull a broad list per company and filter to the
+// target roles in code (the actor's own `title` filter is a single exact phrase and
+// returned ~nothing in testing). API slug uses `~` in the run URL path.
 const APIFY_API_TOKEN = Deno.env.get("APIFY_API_TOKEN") ?? "";
-const APIFY_ACTOR = Deno.env.get("APIFY_ACTOR") ?? "scrapersdelight~decision-maker-email-finder";
-const APIFY_LIMIT = parseInt(Deno.env.get("APIFY_LIMIT") ?? "10", 10); // contacts per domain
+const APIFY_ACTOR = Deno.env.get("APIFY_ACTOR") ?? "deepmine~linkedin-company-employees";
+const DEEPMINE_MAX_RESULTS = parseInt(Deno.env.get("DEEPMINE_MAX_RESULTS") ?? "100", 10); // people pulled per company
+const DEEPMINE_TIMEOUT_S = parseInt(Deno.env.get("DEEPMINE_TIMEOUT_S") ?? "90", 10);
+const DEEPMINE_CONCURRENCY = parseInt(Deno.env.get("DEEPMINE_CONCURRENCY") ?? "20", 10); // parallel company searches
 const APIFY_MAX_DOMAINS = parseInt(Deno.env.get("APIFY_MAX_DOMAINS") ?? "80", 10);
 
 // Wall-clock guard. The edge isolate is hard-killed at ~150s, and the
@@ -40,8 +41,7 @@ const APIFY_MAX_DOMAINS = parseInt(Deno.env.get("APIFY_MAX_DOMAINS") ?? "80", 10
 // starting new provider calls before the budget is spent so the flush always runs.
 const WALL_CLOCK_MS = parseInt(Deno.env.get("WALL_CLOCK_MS") ?? "150000", 10);
 const APPEND_RESERVE_MS = parseInt(Deno.env.get("APPEND_RESERVE_MS") ?? "15000", 10); // headroom for the sheet+email flush
-const HUNTER_CALL_RESERVE_MS = parseInt(Deno.env.get("HUNTER_CALL_RESERVE_MS") ?? "8000", 10); // worst-case one Hunter call
-const APIFY_CALL_RESERVE_MS = parseInt(Deno.env.get("APIFY_CALL_RESERVE_MS") ?? "70000", 10); // worst-case one Apify actor run
+const APIFY_CALL_RESERVE_MS = parseInt(Deno.env.get("APIFY_CALL_RESERVE_MS") ?? "75000", 10); // searches are only started while elapsed < WALL_CLOCK - APPEND_RESERVE - this
 
 // OpenAI org resolver. Last-resort org lookup for alternate_leads.org (which must
 // never be null): the Apify actor returns no company name, and some leads have no
@@ -64,205 +64,141 @@ const SHEET_URL = `https://docs.google.com/spreadsheets/d/${SPREADSHEET_ID}/edit
 const NOTIFY_TO = Deno.env.get("NOTIFY_TO") ?? "liv@myadventuregroup.com.au";
 const NOTIFY_FROM = Deno.env.get("NOTIFY_FROM") ?? "julienne@myadventuregroup.com.au";
 
-// Roles we prioritise (keyword groups matched against Hunter position/department).
-const TARGET_ROLE_KEYWORDS: string[] = [
-  "human resources", "hr ", " hr", "hr manager", "head of hr", "chief people",
-  "people & culture", "people and culture", "people culture",
-  "executive assistant", "personal assistant", "assistant to", "ea to",
-  "events", "event manager", "events manager",
-  "conference",
-  "marketing",
-  "communication", "communications",
-  "learning & development", "learning and development", "l&d", "l & d",
+// Target POC roles, matched (word-boundary regexes) against the person's job TITLE only:
+// Conference/Events Manager, Marketing Manager, Communication Manager,
+// Learning & Development Manager, People & Culture Manager, Executive Assistant.
+const TARGET_ROLE_PATTERNS: RegExp[] = [
+  /\bevents?\b/, /\bconferences?\b/,
+  /\bmarketing\b/,
+  /\bcommunications?\b/,
+  /\blearning (&|and) development\b/, /\bl ?& ?d\b/,
+  /\bpeople (&|and|\+)? ?culture\b/,
+  /\bexecutive assistant\b/,
 ];
 const MAX_TARGET_LEADS = 5; // per org, when target roles are found
-const HUNTER_DELAY_MS = 300; // politeness between distinct domain calls
+const MAX_ROWS_PER_RUN = 20; // hard cap on closed_sequence_threads rows processed per run
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const domainOf = (email: string) => (email.includes("@") ? email.split("@")[1].trim().toLowerCase() : "");
 
-interface HunterEmail {
-  value: string;
+interface Person {
   first_name: string | null;
   last_name: string | null;
-  position: string | null;
-  department: string | null;
-  seniority: string | null;
-  type: string | null; // personal | generic
+  position: string | null; // job title
+  headline: string | null;
 }
-interface HunterResult {
-  organization: string | null;
-  emails: HunterEmail[];
-}
+interface PeopleResult { people: Person[] }
 
-function isTargetRole(e: HunterEmail): boolean {
-  const hay = `${e.position ?? ""} ${e.department ?? ""} ${e.seniority ?? ""}`.toLowerCase();
-  return TARGET_ROLE_KEYWORDS.some((kw) => hay.includes(kw));
+// Matches on the job TITLE only. Headlines are free text ("Retired", "Event Coordinator
+// with dental background", taglines) and produced false matches in testing.
+function isTargetRole(p: Person): boolean {
+  return TARGET_ROLE_PATTERNS.some((re) => re.test((p.position ?? "").toLowerCase()));
 }
 
-// Outcome of a Hunter lookup. `exhausted` means the plan's search credits are
-// used up (switch to the Apify fallback); `error` is transient (retry next run).
-type HunterOutcome =
-  | { status: "ok"; result: HunterResult }
-  | { status: "exhausted" }
-  | { status: "error" };
+const normName = (s: string | null) => (s ?? "").toLowerCase().replace(/[^a-z\s'-]/g, "").replace(/\s+/g, " ").trim();
+const nameKey = (p: Person) => `${normName(p.first_name)} ${normName(p.last_name)}`.trim();
+const normOrg = (s: string) => s.toLowerCase().replace(/\s+/g, " ").trim();
 
-// A 429 from Hunter is ambiguous: it fires both for per-second rate limiting AND
-// for the monthly plan quota being used up. They share id "too_many_requests";
-// only the details text distinguishes them ("...limit for the number of searches
-// per billing period..."). Treat the plan-quota variant as `exhausted`.
-function hunterQuotaExhausted(body: string): boolean {
-  return /billing period|number of searches|per your plan|upgrade your plan/i.test(body);
-}
+// --- DeepMine (Apify) provider ------------------------------------------------
+interface RunState { domainsUsed: number }
 
-async function hunterDomainSearch(domain: string): Promise<HunterOutcome> {
-  if (!HUNTER_API_KEY) {
-    console.warn("HUNTER_IO_API_KEY not set — cannot search domains.");
-    return { status: "error" };
-  }
-  // limit=10 is the Free plan's max page size (higher values return HTTP 400).
-  const url = `https://api.hunter.io/v2/domain-search?domain=${encodeURIComponent(domain)}&limit=10&api_key=${HUNTER_API_KEY}`;
-  try {
-    const res = await fetch(url);
-    if (!res.ok) {
-      const body = await res.text();
-      if ((res.status === 429 || res.status === 403) && hunterQuotaExhausted(body)) {
-        console.warn(`Hunter plan credits exhausted (${res.status}) for ${domain}.`);
-        return { status: "exhausted" };
-      }
-      console.warn(`Hunter ${res.status} for ${domain} — skipping. ${body.slice(0, 160)}`);
-      return { status: "error" };
-    }
-    const json = await res.json();
-    const data = json?.data ?? {};
-    return {
-      status: "ok",
-      result: {
-        organization: data.organization ?? null,
-        emails: Array.isArray(data.emails) ? data.emails : [],
-      },
-    };
-  } catch (err) {
-    console.warn(`Hunter fetch failed for ${domain}: ${err}`);
-    return { status: "error" };
-  }
-}
-
-// --- Apify fallback ---------------------------------------------------------
-interface RunState { useApify: boolean; apifyDomainsUsed: number }
-
-// Map the Apify decision-maker-email-finder dataset (a flat array of records:
-// { email, firstName, lastName, title, seniority, confidence, mxValid, ... }) to
-// the Hunter shape so the rest of the pipeline (pickCandidates / isTargetRole /
-// scoreContact) is unchanged. This actor guesses emails from the company's site,
-// so we drop records with no email or an undeliverable domain (mxValid === false).
-function apifyItemsToResult(items: Record<string, unknown>[]): HunterResult {
-  const cap = (s: unknown): string | null => {
-    const t = typeof s === "string" ? s.trim() : "";
-    return t ? t.charAt(0).toUpperCase() + t.slice(1) : null;
-  };
-  const emails: HunterEmail[] = [];
+function deepmineItemsToResult(items: Record<string, unknown>[]): PeopleResult {
+  const clean = (s: unknown): string | null => { const t = typeof s === "string" ? s.trim() : ""; return t || null; };
+  const people: Person[] = [];
   for (const it of items) {
-    const val = (it.email ?? "") as string;
-    if (!val) continue;                 // no usable email
-    if (it.mxValid === false) continue; // domain can't receive mail
-    emails.push({
-      value: val,
-      first_name: cap(it.firstName),
-      last_name: cap(it.lastName),
-      position: (it.title ?? null) as string | null,
-      department: null,
-      seniority: (it.seniority ?? null) as string | null,
-      type: "personal", // named decision-makers — treat as personal (scored/kept)
-    });
+    const first = clean(it.firstName);
+    const last = clean(it.lastName);
+    if (!first || !last) continue; // need a real person name
+    people.push({ first_name: first, last_name: last, position: clean(it.jobTitle), headline: clean(it.headline) });
   }
-  // This actor has no reliable per-domain org name field; org is left to the
-  // soc-med context fallback (or null for cold leads).
-  return { organization: null, emails };
+  return { people };
 }
 
-async function apifyDomainSearch(domain: string, state: RunState): Promise<HunterResult | null> {
+// Returns null on any provider failure (row stays unprocessed and retries).
+async function deepmineCompanySearch(company: string, state: RunState): Promise<PeopleResult | null> {
   if (!APIFY_API_TOKEN) {
-    console.warn("APIFY_API_TOKEN not set — cannot run Apify fallback.");
+    console.warn("APIFY_API_TOKEN not set - cannot search.");
     return null;
   }
-  if (state.apifyDomainsUsed >= APIFY_MAX_DOMAINS) {
-    console.warn(`Apify per-run cap (${APIFY_MAX_DOMAINS}) reached — leaving ${domain} for next run.`);
+  if (state.domainsUsed >= APIFY_MAX_DOMAINS) {
+    console.warn(`Per-run cap (${APIFY_MAX_DOMAINS}) reached - leaving "${company}" for next run.`);
     return null;
   }
-  const url = `https://api.apify.com/v2/acts/${APIFY_ACTOR}/run-sync-get-dataset-items?token=${APIFY_API_TOKEN}`;
+  const url = `https://api.apify.com/v2/acts/${APIFY_ACTOR}/run-sync-get-dataset-items?timeout=${DEEPMINE_TIMEOUT_S}`;
   try {
     const res = await fetch(url, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ domains: [domain], maxContactsPerDomain: APIFY_LIMIT, maxItems: APIFY_LIMIT, useGoogleFallback: true }),
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${APIFY_API_TOKEN}` },
+      body: JSON.stringify({ companies: [company], maxResults: DEEPMINE_MAX_RESULTS, enrichProfiles: false }),
     });
     if (!res.ok) {
-      console.warn(`Apify ${res.status} for ${domain} — skipping. ${(await res.text()).slice(0, 160)}`);
+      console.warn(`DeepMine ${res.status} for "${company}" - skipping. ${(await res.text()).slice(0, 160)}`);
       return null;
     }
-    state.apifyDomainsUsed++;
+    state.domainsUsed++;
     const items = await res.json();
     if (!Array.isArray(items) || items.length === 0) {
-      console.log(`Apify returned no data for ${domain}.`);
-      return { organization: null, emails: [] };
+      console.log(`DeepMine returned no people for "${company}".`);
+      return { people: [] };
     }
-    return apifyItemsToResult(items as Record<string, unknown>[]);
+    return deepmineItemsToResult(items as Record<string, unknown>[]);
   } catch (err) {
-    console.warn(`Apify fetch failed for ${domain}: ${err}`);
+    console.warn(`DeepMine fetch failed for "${company}": ${err}`);
     return null;
   }
 }
 
-// Provider dispatcher: Hunter is primary; switch to Apify (sticky for the rest of
-// the run) the first time Hunter reports its plan credits are exhausted.
-async function findDomainContacts(domain: string, state: RunState): Promise<HunterResult | null> {
-  if (!state.useApify) {
-    const h = await hunterDomainSearch(domain);
-    if (h.status === "ok") return h.result;
-    if (h.status === "exhausted") {
-      console.warn("Hunter credits exhausted — switching to Apify fallback for the rest of this run.");
-      state.useApify = true;
-      // fall through to Apify for this same domain
-    } else {
-      return null; // transient — leave the row unprocessed so it retries
-    }
-  }
-  return await apifyDomainSearch(domain, state);
-}
-
-// Pick candidates for one org: up to 5 target-role contacts, else 1 fallback.
+// Pick up to MAX_TARGET_LEADS target-role people for one org. NO fallback: if nobody
+// matches the target roles, nothing is inserted and the row is flagged
+// failed_apify_search = true by run().
+// `known` holds "name|org" and "name|domain" keys of people already in alternate_leads
+// (or inserted this run) - there is no email to dedupe on.
 function pickCandidates(
-  result: HunterResult,
+  result: PeopleResult,
   originalEmail: string,
-  excluded: Set<string>, // lowercased emails already in AC / alternate_leads / this run
-): HunterEmail[] {
-  const origLower = originalEmail.toLowerCase();
-  const usable = result.emails.filter((e) => {
-    if (!e.value) return false;
-    const v = e.value.toLowerCase();
-    return v !== origLower && !excluded.has(v);
+  domain: string,
+  org: string,
+  known: Set<string>,
+): Person[] {
+  const orig = originalEmail.split("@")[0].toLowerCase().replace(/[^a-z]/g, "");
+  const seen = new Set<string>();
+  const eligible = result.people.filter((p) => {
+    const f = normName(p.first_name).replace(/[^a-z]/g, "");
+    const l = normName(p.last_name).replace(/[^a-z]/g, "");
+    if (f && l && orig.includes(f) && orig.includes(l)) return false; // the unresponsive lead themself
+    const k = nameKey(p);
+    if (!k || seen.has(k)) return false;
+    if (known.has(`${k}|${domain}`) || (org && known.has(`${k}|${normOrg(org)}`))) return false;
+    seen.add(k);
+    return true;
   });
 
-  const targets = usable.filter(isTargetRole);
-  // Prefer personal, named contacts within targets.
-  targets.sort((a, b) => scoreContact(b) - scoreContact(a));
-  if (targets.length > 0) return targets.slice(0, MAX_TARGET_LEADS);
-
-  // Fallback: max 1 of any role, prefer personal + named.
-  const fallback = usable.filter((e) => e.type !== "generic");
-  fallback.sort((a, b) => scoreContact(b) - scoreContact(a));
-  const chosen = fallback.length > 0 ? fallback[0] : usable[0];
-  return chosen ? [chosen] : [];
+  const targets = eligible.filter(isTargetRole);
+  // Prefer people whose job TITLE (not just headline) matches a target role.
+  const score = (p: Person) => (p.position && TARGET_ROLE_PATTERNS.some((re) => re.test(p.position!.toLowerCase())) ? 2 : 0);
+  targets.sort((a, b) => score(b) - score(a));
+  return targets.slice(0, MAX_TARGET_LEADS);
 }
 
-function scoreContact(e: HunterEmail): number {
-  let s = 0;
-  if (e.type === "personal") s += 2;
-  if (e.first_name) s += 1;
-  if (e.last_name) s += 1;
-  if (e.position) s += 1;
-  return s;
+// People already in alternate_leads, as "name|org" and (when an email exists) "name|email-domain".
+async function loadExistingPeople(db: SupabaseClient): Promise<Set<string>> {
+  const set = new Set<string>();
+  const pageSize = 1000;
+  let from = 0;
+  while (true) {
+    const { data, error } = await db.from("alternate_leads").select("poc_firstname, poc_lastname, org, email").range(from, from + pageSize - 1);
+    if (error) { console.warn(`loadExistingPeople error: ${error.message}`); break; }
+    if (!data || data.length === 0) break;
+    for (const r of data as Record<string, unknown>[]) {
+      const k = nameKey({ first_name: (r.poc_firstname as string) ?? null, last_name: (r.poc_lastname as string) ?? null, position: null, headline: null });
+      if (!k) continue;
+      if (typeof r.org === "string" && r.org.trim()) set.add(`${k}|${normOrg(r.org)}`);
+      if (typeof r.email === "string" && r.email) set.add(`${k}|${domainOf(r.email)}`);
+    }
+    if (data.length < pageSize) break;
+    from += pageSize;
+  }
+  return set;
 }
 
 // Parse "Awesome {event} - What's Next for 2026?" -> {event}.
@@ -514,21 +450,24 @@ async function acContactExists(email: string): Promise<boolean> {
   }
 }
 
-async function run(limit?: number, opts?: { forceApify?: boolean; notifyTo?: string }): Promise<Record<string, unknown>> {
+async function run(limit?: number, opts?: { notifyTo?: string }): Promise<Record<string, unknown>> {
   const db = createClient(SUPABASE_URL, SERVICE_ROLE_KEY, {
     auth: { persistSession: false },
   });
-  const state: RunState = { useApify: opts?.forceApify ?? false, apifyDomainsUsed: 0 };
+  const state: RunState = { domainsUsed: 0 };
   const runStarted = Date.now();
 
-  // 1. Unresponsive leads to process. Capped at 20 rows per run by default; the
-  //    `?limit=N` param overrides it (testing).
-  const rowLimit = limit && limit > 0 ? limit : 20;
+  // 1. Unresponsive leads to process. HARD cap of MAX_ROWS_PER_RUN (20) rows per run;
+  //    `?limit=N` can only lower it (testing), never raise it above the cap.
+  const rowLimit = limit && limit > 0 ? Math.min(limit, MAX_ROWS_PER_RUN) : MAX_ROWS_PER_RUN;
   const query = db
     .from("closed_sequence_threads")
     .select("id, thread_id, source_table, email")
     .not("email", "is", null)
     .or("is_processed.is.null,is_processed.eq.false")
+    // Skip rows whose search already ran and found no target-role lead, so they don't
+    // hog the 20-row queue every week. To retry one: set failed_apify_search = null.
+    .not("failed_apify_search", "is", true)
     .order("id", { ascending: true })
     .limit(rowLimit);
   const { data: rows, error: qErr } = await query;
@@ -539,13 +478,8 @@ async function run(limit?: number, opts?: { forceApify?: boolean; notifyTo?: str
   console.log(`Processing ${rows?.length ?? 0} unresponsive lead(s).`);
   if (!rows || rows.length === 0) return { rows: 0, processed: 0, inserted: 0 };
 
-  // Dedup sets: AC contacts (cached table) + existing alternate_leads.
-  const acEmails = await loadEmailSet(db, "activecampaign_contacts");
-  const acTableEmpty = acEmails.size === 0;
-  if (acTableEmpty) {
-    console.warn("activecampaign_contacts is EMPTY — falling back to live ActiveCampaign API for dedup.");
-  }
-  const existingAlt = await loadEmailSet(db, "alternate_leads");
+  // Dedup: DeepMine gives no emails, so people are deduped by name + org / email domain.
+  const knownPeople = await loadExistingPeople(db);
 
   // Context maps for carrying speaker/subject/event onto soc-med leads.
   const threadIds = [...new Set(rows.map((r) => r.thread_id).filter(Boolean))] as string[];
@@ -553,18 +487,62 @@ async function run(limit?: number, opts?: { forceApify?: boolean; notifyTo?: str
   const followCtx = await loadContext(db, "follow_up_sequence_threads", threadIds, ["speaker", "subject", "poc_firstname", "source_type_id"]);
   const coldCtx = await loadContext(db, "cold_leads_follow_up_sequence_threads", threadIds, ["speaker", "subject", "poc_firstname", "source_type_id"]);
   const socMedCtx = await loadSocMed(db, threadIds, emails);
-  // org must never be null on an alternate lead: when Hunter/Apify return no org,
-  // carry over the ORIGINAL lead's org, looked up by the original email across the
-  // cold detail tables (ai_verified_cold_leads, manually_found_cold_leads) and the
-  // soc-med detail tables (ai_scraped_soc_med_leads, manually_found_leads).
+  // org must never be null on an alternate lead AND DeepMine searches by company NAME,
+  // so org is resolved BEFORE the search: soc-med context -> the ORIGINAL lead's org
+  // by email (cold + soc-med detail tables) -> OpenAI web-search resolver -> bare domain.
   const origOrgByEmail = await loadOrgByEmail(db, emails);
 
-  const domainCache = new Map<string, HunterResult | null>();
-  const orgCache = new Map<string, string>(); // resolved org per domain (incl. OpenAI last-resort)
-  const insertedThisRun = new Set<string>();
+  const domainCache = new Map<string, PeopleResult | null>();
+  const orgCache = new Map<string, string>(); // OpenAI-resolved org per domain
+  const resolveOrg = async (domain: string, hint?: string): Promise<string> => {
+    if (!orgCache.has(domain)) orgCache.set(domain, await resolveOrgViaOpenAI(domain, hint));
+    return orgCache.get(domain)!;
+  };
   let inserted = 0;
   let processed = 0;
   let stoppedEarly = false;
+
+  // Run `fn` over `items` with at most `limit` in flight at once.
+  const mapLimit = async <T>(items: T[], limit: number, fn: (item: T) => Promise<void>): Promise<void> => {
+    let next = 0;
+    await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => {
+      while (next < items.length) await fn(items[next++]);
+    }));
+  };
+
+  // ---- Pre-pass: ONE org + ONE DeepMine search per DISTINCT company, run in parallel.
+  // The actor works through companies serially (~40s each), so a single multi-company
+  // call can't fit the ~150s isolate; parallel single-company calls can.
+  const domainOrg = new Map<string, string>();
+  const domains: string[] = [];
+  for (const row of rows) {
+    const e = row.email as string;
+    const d = domainOf(e);
+    if (!d) continue;
+    if (!domains.includes(d)) domains.push(d);
+    if (!domainOrg.has(d)) {
+      const sm0 = socMedCtx.get(row.thread_id) ?? socMedCtx.get(e.toLowerCase());
+      const o = (sm0?.org ?? origOrgByEmail.get(e.toLowerCase()) ?? "").trim();
+      if (o) domainOrg.set(d, o);
+    }
+  }
+  // Companies with no org in the DB: resolve via OpenAI (parallel).
+  await mapLimit(domains.filter((d) => !domainOrg.has(d)), DEEPMINE_CONCURRENCY, async (d) => {
+    domainOrg.set(d, await resolveOrg(d));
+  });
+  // Search every company in parallel (bounded by DEEPMINE_CONCURRENCY).
+  await mapLimit(domains, DEEPMINE_CONCURRENCY, async (d) => {
+    // Wall-clock guard: don't start a search that can't finish before the sheet flush;
+    // those rows are left unprocessed and retry next run.
+    if (Date.now() - runStarted > WALL_CLOCK_MS - APPEND_RESERVE_MS - APIFY_CALL_RESERVE_MS) {
+      stoppedEarly = true;
+      console.warn(`Wall-clock budget nearly spent - skipping search for ${d}; its rows retry next run.`);
+      domainCache.set(d, null);
+      return;
+    }
+    domainCache.set(d, await deepmineCompanySearch(domainOrg.get(d)!, state));
+  });
+  console.log(`Searched ${domains.length} company(ies) in ${Math.round((Date.now() - runStarted) / 1000)}s.`);
 
   for (const row of rows) {
     const email = row.email as string;
@@ -572,81 +550,44 @@ async function run(limit?: number, opts?: { forceApify?: boolean; notifyTo?: str
     if (!domain) {
       // No parseable domain -> no lead possible. Per the strict rule we do NOT
       // mark it processed (only a real inserted lead does that); the skip is free.
-      console.warn(`Row ${row.id} has no parseable domain from "${email}" — skipping (left unprocessed).`);
+      console.warn(`Row ${row.id} has no parseable domain from "${email}" - skipping (left unprocessed).`);
       continue;
     }
 
-    let result = domainCache.get(domain);
-    if (result === undefined) {
-      // Wall-clock guard — only before an actual provider call (cache misses are
-      // free). If starting one risks overrunning the isolate's hard kill, stop the
-      // loop now so the append+email flush below still runs and this run's inserts
-      // reach the sheet. Remaining rows are left unprocessed and retry next run.
-      const callReserve = state.useApify ? APIFY_CALL_RESERVE_MS : HUNTER_CALL_RESERVE_MS;
-      if (Date.now() - runStarted > WALL_CLOCK_MS - APPEND_RESERVE_MS - callReserve) {
-        stoppedEarly = true;
-        console.warn(`Wall-clock budget nearly spent — stopping before ${domain} (row ${row.id}); ${inserted} lead(s) inserted so far. Remaining rows left unprocessed for retry; flushing to sheet.`);
-        break;
-      }
-      result = await findDomainContacts(domain, state);
-      domainCache.set(domain, result);
-      await sleep(HUNTER_DELAY_MS);
-    }
+    const leadType = row.source_table === "follow_up_sequence_threads" ? "soc med"
+      : row.source_table === "cold_leads_follow_up_sequence_threads" ? "cold"
+      : null;
+    const ctx = followCtx.get(row.thread_id) ?? coldCtx.get(row.thread_id) ?? {};
+    const sm = socMedCtx.get(row.thread_id) ?? socMedCtx.get(email.toLowerCase());
+    const org = (sm?.org ?? origOrgByEmail.get(email.toLowerCase()) ?? "").trim() || domainOrg.get(domain) || domain;
 
+    const result = domainCache.get(domain) ?? null;
     if (result === null) {
-      // Provider errored / rate-limited / no key / cap hit — leave unprocessed so
-      // it retries next run rather than silently burning the row.
-      console.warn(`No provider result for ${domain} — leaving row ${row.id} unprocessed for retry.`);
+      // Provider errored / no token / cap hit / skipped by the wall-clock guard - leave
+      // unprocessed so it retries next run rather than silently burning the row.
+      console.warn(`No provider result for ${domain} - leaving row ${row.id} unprocessed for retry.`);
       continue;
     }
 
     let insertedThisRow = 0;
     {
-      const excluded = new Set<string>([...acEmails, ...existingAlt, ...insertedThisRun]);
-      const candidates = pickCandidates(result, email, excluded);
+      const candidates = pickCandidates(result, email, domain, org, knownPeople);
 
-      const leadType = row.source_table === "follow_up_sequence_threads" ? "soc med"
-        : row.source_table === "cold_leads_follow_up_sequence_threads" ? "cold"
-        : null;
-
-      const ctx = followCtx.get(row.thread_id) ?? coldCtx.get(row.thread_id) ?? {};
-      const sm = socMedCtx.get(row.thread_id) ?? socMedCtx.get(email.toLowerCase());
-      const speaker = (leadType === "soc med") ? (sm?.speaker_name ?? ctx.speaker ?? null) : (ctx.speaker ?? null);
       const subject = ctx.subject ?? null;
+      const speaker = (leadType === "soc med") ? (sm?.speaker_name ?? ctx.speaker ?? null) : (ctx.speaker ?? null);
       const event = (leadType === "soc med")
         ? (sm?.event_name ?? eventFromSubject(subject))
         : null;
-      // org must never be null. Order: provider org (Hunter) -> soc-med context ->
-      // carry over the original lead's org by email -> OpenAI resolver (domain +
-      // contact hint, cached per domain) -> bare domain. Only resolved when there
-      // is at least one candidate to insert, so we don't spend an OpenAI call on a
-      // row that inserts nothing.
-      let org: string | null = result.organization ?? sm?.org ?? origOrgByEmail.get(email.toLowerCase()) ?? null;
-      if ((!org || !org.trim()) && candidates.length > 0) {
-        if (!orgCache.has(domain)) {
-          const c0 = candidates[0];
-          const hint = [[c0.first_name, c0.last_name].filter(Boolean).join(" "), c0.position]
-            .filter(Boolean).join(", ");
-          orgCache.set(domain, await resolveOrgViaOpenAI(domain, hint || undefined));
-        }
-        org = orgCache.get(domain)!;
-      }
 
       for (const c of candidates) {
-        const vLower = c.value.toLowerCase();
-        // Live AC fallback: when the cached table is empty, verify against AC directly.
-        if (acTableEmpty && await acContactExists(c.value)) {
-          console.log(`Skipping ${c.value} — already in ActiveCampaign (live check).`);
-          continue;
-        }
         const { error: insErr } = await db.from("alternate_leads").insert({
           source_table: row.source_table,
           thread_id: row.thread_id,
           source_type_id: ctx.source_type_id ?? null,
-          email: c.value,
+          email: null, // DeepMine provides no emails
           poc_firstname: c.first_name,
           poc_lastname: c.last_name,
-          poc_role: c.position,
+          poc_role: c.position ?? c.headline,
           org,
           speaker,
           event,
@@ -655,28 +596,41 @@ async function run(limit?: number, opts?: { forceApify?: boolean; notifyTo?: str
           is_added_to_sheet: false,
         });
         if (insErr) {
-          console.warn(`Insert failed for ${c.value}: ${insErr.message}`);
+          console.warn(`Insert failed for ${c.first_name} ${c.last_name}: ${insErr.message}`);
           continue;
         }
-        insertedThisRun.add(vLower);
+        const k = nameKey(c);
+        knownPeople.add(`${k}|${domain}`);
+        if (org) knownPeople.add(`${k}|${normOrg(org)}`);
         inserted++;
         insertedThisRow++;
       }
     }
 
-    // 4. Mark the source row processed ONLY when a real alternate lead (with an
-    //    email) was actually inserted for it. If the provider found nothing, or
-    //    every candidate was already known (deduped away), leave the row
-    //    unprocessed so it retries next run — no row is burned without a lead.
+    // 4. Mark the source row processed ONLY when a real alternate lead was actually
+    //    inserted for it. If the provider found nothing, nobody matched the target
+    //    roles, or every candidate was already known, leave the row unprocessed so it
+    //    retries next run - no row is burned without a lead.
+    //    The search itself succeeded here (provider errors `continue`d above), so:
+    //    lead inserted -> is_processed = true, failed_apify_search = false;
+    //    no matching lead -> failed_apify_search = true (is_processed stays null).
     if (insertedThisRow > 0) {
       await markProcessed(db, row.id);
       processed++;
     } else {
-      console.log(`No new lead inserted for row ${row.id} (${domain}) — leaving unprocessed to retry.`);
+      await markFailedSearch(db, row.id);
+      // If the company has NO target-role people at all, every other unprocessed row
+      // for the same company (same email domain) would fail identically - flag them all
+      // now so we don't re-search the company. (If target people existed but were all
+      // excluded - e.g. this row's own original lead - other rows may still match, so
+      // only this row is flagged.)
+      let siblings = 0;
+      if (!result.people.some(isTargetRole)) siblings = await markCompanyFailed(db, domain, row.id);
+      console.log(`No matching lead for row ${row.id} (${domain}) - flagged failed_apify_search=true${siblings ? ` (+${siblings} other row(s) for the same company)` : ""}.`);
     }
   }
 
-  console.log(`Inserted ${inserted} alternate lead(s) across ${domainCache.size} domain(s).${stoppedEarly ? " (stopped early on wall-clock budget — remaining rows retry next run)" : ""}`);
+  console.log(`Inserted ${inserted} alternate lead(s) across ${domainCache.size} domain(s).${stoppedEarly ? " (stopped early on wall-clock budget - remaining rows retry next run)" : ""}`);
 
   // 5. Append newly found leads to the sales sheet, then email Liv a preview
   //    (?to= redirects the notification during testing so Liv isn't emailed).
@@ -684,8 +638,7 @@ async function run(limit?: number, opts?: { forceApify?: boolean; notifyTo?: str
 
   return {
     rows: rows.length, processed, inserted, domains: domainCache.size, stoppedEarly,
-    provider: state.useApify ? "apify" : "hunter", apifyDomains: state.apifyDomainsUsed,
-    acEmails: acEmails.size, acLiveFallback: acTableEmpty, ...sheetResult,
+    provider: "deepmine", deepmineSearches: state.domainsUsed, ...sheetResult,
   };
 }
 
@@ -734,7 +687,7 @@ function buildEmailHtml(leads: AltRow[]): string {
       <td style="padding:6px 10px;border-bottom:1px solid #eee">${esc(r.org ?? "—")}</td>
       <td style="padding:6px 10px;border-bottom:1px solid #eee">${esc(name)}</td>
       <td style="padding:6px 10px;border-bottom:1px solid #eee">${esc(r.poc_role ?? "—")}</td>
-      <td style="padding:6px 10px;border-bottom:1px solid #eee"><a href="mailto:${esc(r.email ?? "")}">${esc(r.email ?? "—")}</a></td>
+      <td style="padding:6px 10px;border-bottom:1px solid #eee">${r.email ? `<a href="mailto:${esc(r.email)}">${esc(r.email)}</a>` : "—"}</td>
       <td style="padding:6px 10px;border-bottom:1px solid #eee">${esc(r.lead_type ?? "—")}</td>
       <td style="padding:6px 10px;border-bottom:1px solid #eee">${ctx || "—"}</td>
     </tr>`;
@@ -838,9 +791,11 @@ async function loadOrgByEmail(db: SupabaseClient, emails: string[]): Promise<Map
 async function resolveOrgViaOpenAI(domain: string, hint?: string): Promise<string> {
   if (!OPENAI_API_KEY) return domain; // not configured — fall back to the domain
   try {
-    const input = `What is the official name of the organization that owns the website `
-      + `domain ${domain}?` + (hint ? ` A known contact there: ${hint}.` : "")
-      + ` Reply with ONLY the organization name and nothing else. If you cannot `
+    const input = `What is the common trading name of the organization that owns the website `
+      + `domain ${domain}, as it would appear on its LinkedIn company page?` + (hint ? ` A known contact there: ${hint}.` : "")
+      + ` Use the short everyday name (e.g. "AMCA Australia", not "Air Conditioning & Mechanical `
+      + `Contractors' Association of Australia Limited") and drop legal suffixes such as Pty Ltd, `
+      + `Limited, Inc. Reply with ONLY the organization name and nothing else. If you cannot `
       + `determine it with confidence, reply with exactly: ${domain}`;
     const res = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
@@ -932,8 +887,30 @@ async function loadSocMed(
 }
 
 async function markProcessed(db: SupabaseClient, id: number): Promise<void> {
-  const { error } = await db.from("closed_sequence_threads").update({ is_processed: true }).eq("id", id);
+  const { error } = await db.from("closed_sequence_threads").update({ is_processed: true, failed_apify_search: false }).eq("id", id);
   if (error) console.warn(`markProcessed(${id}) failed: ${error.message}`);
+}
+
+// Flag every OTHER not-yet-processed row for the same company (email domain) as a
+// failed search. Never touches processed rows or rows already flagged. Returns the count.
+async function markCompanyFailed(db: SupabaseClient, domain: string, exceptId: number): Promise<number> {
+  const pattern = `%@${domain.replace(/[\\%_]/g, "\\$&")}`;
+  const { data, error } = await db
+    .from("closed_sequence_threads")
+    .update({ failed_apify_search: true })
+    .ilike("email", pattern)
+    .neq("id", exceptId)
+    .or("is_processed.is.null,is_processed.eq.false")
+    .not("failed_apify_search", "is", true)
+    .select("id");
+  if (error) { console.warn(`markCompanyFailed(${domain}) failed: ${error.message}`); return 0; }
+  return data?.length ?? 0;
+}
+
+// The DeepMine search ran but produced no lead within the target roles.
+async function markFailedSearch(db: SupabaseClient, id: number): Promise<void> {
+  const { error } = await db.from("closed_sequence_threads").update({ failed_apify_search: true }).eq("id", id);
+  if (error) console.warn(`markFailedSearch(${id}) failed: ${error.message}`);
 }
 
 Deno.serve(async (req: Request) => {
@@ -991,36 +968,18 @@ Deno.serve(async (req: Request) => {
     return Response.json(out);
   }
 
-  // Debug: ?probe=<domain> reports what the runtime sees (key length + raw
-  // Hunter HTTP status/body snippet), to diagnose credential/egress issues.
-  if (params.get("probe")) {
-    const dom = params.get("probe")!;
-    const info: Record<string, unknown> = { hunterKeyLen: HUNTER_API_KEY.length };
+  // Debug: ?probe=<company name or domain> runs the DeepMine actor directly (no writes)
+  // and reports how many people came back and which pass the target-role filter.
+  // The actor searches by company NAME, so a bare domain may match poorly.
+  if (params.get("probe") || params.get("aprobe")) {
+    const q = (params.get("probe") ?? params.get("aprobe"))!;
+    const info: Record<string, unknown> = { apifyKeyLen: APIFY_API_TOKEN.length, actor: APIFY_ACTOR, query: q };
     try {
-      const r = await fetch(`https://api.hunter.io/v2/domain-search?domain=${encodeURIComponent(dom)}&limit=3&api_key=${HUNTER_API_KEY}`);
-      const body = await r.text();
-      info.status = r.status;
-      info.bodySnippet = body.slice(0, 200);
-    } catch (err) {
-      info.fetchError = String(err);
-    }
-    return Response.json(info);
-  }
-
-  // Debug: ?aprobe=<domain> runs the Apify fallback actor directly and reports the
-  // raw HTTP status + a body snippet, to confirm the actor's field names/mapping.
-  if (params.get("aprobe")) {
-    const dom = params.get("aprobe")!;
-    const info: Record<string, unknown> = { apifyKeyLen: APIFY_API_TOKEN.length, actor: APIFY_ACTOR };
-    try {
-      const r = await fetch(`https://api.apify.com/v2/acts/${APIFY_ACTOR}/run-sync-get-dataset-items?token=${APIFY_API_TOKEN}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ domains: [dom], maxContactsPerDomain: APIFY_LIMIT, maxItems: APIFY_LIMIT, useGoogleFallback: true }),
-      });
-      const body = await r.text();
-      info.status = r.status;
-      info.bodySnippet = body.slice(0, 800);
+      const r = await deepmineCompanySearch(q, { domainsUsed: 0 });
+      info.returned = r ? r.people.length : null; // null = provider failure (see logs)
+      info.targets = r ? r.people.filter(isTargetRole).map((p) => ({ name: `${p.first_name} ${p.last_name}`, role: p.position ?? p.headline })) : null;
+      // What the picker would choose (target-role people only).
+      info.picked = r ? pickCandidates(r, "", "", "", new Set()).map((p) => ({ name: `${p.first_name} ${p.last_name}`, role: p.position ?? p.headline })) : null;
     } catch (err) {
       info.fetchError = String(err);
     }
@@ -1035,16 +994,14 @@ Deno.serve(async (req: Request) => {
     return Response.json({ domain: dom, model: OPENAI_MODEL, openaiKeyLen: OPENAI_API_KEY.length, org });
   }
 
-  // ?provider=apify forces the Apify fallback path (skips Hunter) for testing.
   // ?to= redirects the notification email (use when testing so Liv isn't emailed).
-  const forceApify = params.get("provider") === "apify";
   const notifyTo = params.get("to") ?? undefined;
 
   // Debug/testing: ?sync=1 awaits the work and returns the outcome (or error)
   // in the response, so failures are visible instead of vanishing in the bg task.
   if (params.get("sync") === "1") {
     try {
-      const result = await run(limit, { forceApify, notifyTo });
+      const result = await run(limit, { notifyTo });
       return Response.json({ status: "done", ...result });
     } catch (err) {
       console.error(`run() crashed: ${err}`);
@@ -1052,7 +1009,7 @@ Deno.serve(async (req: Request) => {
     }
   }
 
-  const work = run(limit, { forceApify, notifyTo }).catch((err) => console.error(`run() crashed: ${err}`));
+  const work = run(limit, { notifyTo }).catch((err) => console.error(`run() crashed: ${err}`));
   if (typeof EdgeRuntime !== "undefined") {
     EdgeRuntime.waitUntil(work);
   }
