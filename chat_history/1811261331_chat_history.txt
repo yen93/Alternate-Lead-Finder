@@ -1,0 +1,133 @@
+================================================================================
+CHAT HISTORY EXPORT — 2026-11-18 (full session, second export)
+Session: Diagnosed why the Alternate Lead Finder stopped adding leads (Hunter key 401),
+rebuilt the edge function around the Apify DeepMine LinkedIn employees actor (target-
+role people, names + titles, no emails), added the failed_apify_search flag, a hard
+20-row cap, parallel per-company searches and title-only role matching, tested the
+Lusha V3 key, added alternate_leads.sheet_remark (one-time copy from the sheet), and
+finally removed the Google Sheet append from the function (v60). Supersedes/extends
+1811261314_chat_history.txt, which covers the session up to the title-only change.
+================================================================================
+
+NOTE ON REDACTIONS: No live secret VALUES were exposed this session. API keys/tokens
+(Supabase management token, Apify token, Lusha key) were read from their gitignored
+local files via shell variables and only used in request headers; none was printed.
+n8n webhook URLs/UUIDs that appeared in the user's message and in cron.job output are
+shown here as [REDACTED_N8N_WEBHOOK_ID] since they act as capability URLs.
+
+--------------------------------------------------------------------------------
+USER:
+Ran process_unresponsive_lead('1a17f7c4d90ca6c6') and asked why the thread did not get
+added to alternate_leads.
+
+--------------------------------------------------------------------------------
+ASSISTANT:
+Read-only investigation: that function only inserts into closed_sequence_threads (row
+id 355, michael.biercuk@salus.vc, is_processed null) — alternate_leads is filled by the
+weekly edge function (Mon 6:55 AM PHT). Noted the same email was already alternate lead
+id 45. Follow-ups answered: the function sets is_added_to_sheet=true after a successful
+sheet append; it appends to the sheet (index.ts ~765-796); the n8n webhook
+[REDACTED_N8N_WEBHOOK_ID] is not scheduled in either project's cron.job (closest is
+n8n-closed-threads-processing, jobid 33); n8n fills closed_sequence_threads and the edge
+function builds alternate_leads from it (confirmed under /q read-only).
+
+--------------------------------------------------------------------------------
+USER / ASSISTANT:
+User asked why the last sheet row was Nov 8 with many rows pending. Found 243 pending
+rows; cron job 3 fired Nov 15 22:55 UTC but every Hunter call returned 401 ("No user
+found for the API key supplied") -> 0 leads. The Apify fallback only triggered on the
+429 quota signal. User: make it fall back to Apify on 401 -> edited, deployed v52,
+tested limit=1 (fallback worked; old actor found nothing for amca.com.au).
+
+--------------------------------------------------------------------------------
+USER / ASSISTANT:
+User asked to test the Lusha key (44 free credits). V2 returned 410 (V2 sunset
+2026-11-30). A web-fetch subagent read the V3 docs; usage call showed 44/44 credits
+(free plan); one prospecting search for amca.com.au returned the CEO for 1 credit
+(email needs a 1-credit reveal). Not wired in.
+
+--------------------------------------------------------------------------------
+USER / ASSISTANT:
+User asked for an Apify actor that returns just names/positions. Web search + public
+actor schemas -> tested deepmine~linkedin-company-employees for "AMCA Australia" (8
+people, ~3 usable). User supplied six target roles (Conference/Events Manager,
+Marketing Manager, Communication Manager, L&D Manager, People & Culture Manager,
+Executive Assistant). Tests on Housing Industry Association: broad 50-person pull +
+keyword filter kept 2/50; the actor's `title` filter (single exact phrase) returned
+0-1 for every phrase. Recommended broad pull + code-side filtering.
+
+--------------------------------------------------------------------------------
+USER / ASSISTANT:
+"Apply the filtering reco; only DeepMine; no Hunter, no Lusha." Rewrote index.ts (spliced
+by line range, tsc syntax check — no Deno installed): DeepMine only, org resolved BEFORE
+the search, leads inserted with email NULL, dedupe by name+org / name+email-domain,
+exclude the unresponsive lead, processed when >=1 lead inserted. Flagged risks (n8n
+mailers with null emails unverified; NOT IN + NULL breaks the user's pending-rows
+query; no ActiveCampaign dedup). Then: hard cap of 20 rows/run (?limit can only lower);
+deployed v53 and tested limit=1 — OpenAI returned the long legal name for AMCA so
+DeepMine returned 0; fixed the resolver prompt to ask for the common/LinkedIn trading
+name (v54, orgprobe -> "AMCA Australia"); rerun still no AMCA target-role match. A
+"closest person" fallback was added (v55) and then removed at the user's request.
+
+--------------------------------------------------------------------------------
+USER / ASSISTANT:
+User: add closed_sequence_threads.failed_apify_search (boolean): true = search found no
+matching lead, false = processed with a matching lead. Applied migration; run() sets
+is_processed=true+failed=false on success, failed=true on a successful search with no
+match, null on provider errors; failed=true rows are skipped by the queue (decision
+flagged). v56 test: row 58 flagged true. User then asked that other rows of the same
+company also be flagged true -> markCompanyFailed (same email domain, only when the
+company has no target-role people at all); v57 full run processed Sydney Uni Sport (4
+leads) and flagged AMCA rows, but only 2 companies fit the wall clock (~35s/search).
+
+--------------------------------------------------------------------------------
+USER / ASSISTANT:
+User: "batch all companies in one call." A real 3-company batch took 125s (the actor
+works through companies serially; results carry searchQuery = input company), so 20
+companies can't fit the ~150s isolate. User chose parallel per-company calls. Rewrote
+run() with a pre-pass (distinct domains, orgs via OpenAI in parallel, one DeepMine
+search per company in parallel, DEEPMINE_CONCURRENCY 20). v58 full run (email redirected
+to the user): 18 companies in 78s / 90s total, 11 rows processed, 26 leads. User then:
+match job title only + update CLAUDE.md -> isTargetRole uses jobTitle only; CLAUDE.md
+rewritten; v59 full run: 87s, 16 companies, 12 of 20 rows processed, 39 leads;
+totals 24 processed ok / 39 flagged failed / 200 pending. Remaining false positives
+noted (company name as title, "event labourer", non-AU executives); optional role-word
+filter offered, not applied. /dcp saved the first chat export (1811261314), updated
+as_built.txt; /cm produced a commit command.
+
+--------------------------------------------------------------------------------
+USER:
+One-time update of alternate_leads: add column sheet_remark = the sheet's Remark column
+value ('Send intro', '5A', or null).
+
+--------------------------------------------------------------------------------
+ASSISTANT:
+Read the sheet via the Google Sheets connector (columns: ... Original Thread ID, Remark,
+Status). Applied migration adding sheet_remark text, then one UPDATE matching by lower
+(email) from a VALUES list of the 74 sheet rows with remarks. Result over 144 rows: 44
+Send intro, 30 5A, 70 null (69 email-less new leads have no remark on the sheet; row 71
+info@dancesensations.com.au is not on the sheet). Status column deliberately not copied.
+
+--------------------------------------------------------------------------------
+USER / ASSISTANT:
+User: "minor update: the edge function should not append to the sheet anymore." Edited
+index.ts: removed the append (appendToSheetAndNotify -> notifyNewLeads, which emails a
+preview of only the alternate_leads ids inserted this run, up to 100 rows, no sheet
+button; ?append=1 now returns {"status":"disabled"}; is_added_to_sheet no longer
+maintained). Type-checked. User: "deploy it" -> deployed v60 (ACTIVE); verified
+?append=1 returns disabled. No full test run performed after v60. Next scheduled run:
+Sun 22:55 UTC (Mon 6:55 AM PHT) will email Liv from the new code.
+
+--------------------------------------------------------------------------------
+USER:
+/dcp — save chat, update as_built.txt / CLAUDE.md / .gitignore (no git).
+
+--------------------------------------------------------------------------------
+ASSISTANT:
+Wrote this export; updated CLAUDE.md and as_built.txt for the sheet-append removal,
+notifyNewLeads, sheet_remark and version 60. .gitignore already covers the secret files.
+No git commands run.
+
+================================================================================
+END OF EXPORT
+================================================================================

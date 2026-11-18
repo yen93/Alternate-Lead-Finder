@@ -3,8 +3,9 @@
 Weekly automation: for each closed/unresponsive lead in `closed_sequence_threads`,
 find DIFFERENT people at the same company who hold one of the **target POC roles**
 (Apify actor `deepmine~linkedin-company-employees` — names + job titles only, **no
-emails**), record them in `alternate_leads` (`email` is NULL), append to the sales
-Google Sheet, and email Liv a preview. The whole thing is one Supabase edge function
+emails**), record them in `alternate_leads` (`email` is NULL), and email Liv a preview of
+the leads found that run. (It NO LONGER appends to the Google Sheet — removed in v60.) The
+whole thing is one Supabase edge function
 plus two pg_cron jobs. (Hunter.io, the old Apify email-finder and Lusha are NOT used
 any more — see "Providers history".)
 
@@ -24,15 +25,15 @@ any more — see "Providers history".)
   202 immediately — so a normal invocation returns `{"status":"started"}`, not the
   result. Use `?sync=1` to await and see the summary/error.
 - Debug params: `?sync=1`, `?limit=N` (can only LOWER the 20-row cap), `?inspect=1`
-  (check Sheets/Gmail/AC access, no send), `?append=1` (only the append+email step,
-  no searches), `?probe=<company name or domain>` (alias `?aprobe=`; raw DeepMine
+  (check Sheets/Gmail/AC access, no send), `?append=1` (DISABLED — returns
+  `{"status":"disabled"}`, no-op), `?probe=<company name or domain>` (alias `?aprobe=`; raw DeepMine
   search, no writes — shows how many people came back, which match the target roles
   and what the picker would choose; the actor searches by company NAME so a bare
   domain may match poorly), `?orgprobe=<domain>` (raw OpenAI org-resolver check,
   optional `&hint=<text>`; no writes), `?fixorg=1` (maintenance: sync the sheet's Org
   column to the DB, matching rows by **email** — leads with no email are skipped),
   `?to=<email>` (redirect the notification email — ALWAYS use this when testing so Liv
-  isn't emailed; honoured by `?sync` runs too, not just `?append`).
+  isn't emailed; honoured by `?sync` runs).
 - Deploy: **no supabase CLI is installed.** Deploy via the Management API multipart
   endpoint (reads the file directly, avoids JSON-escaping the backslashes in the
   code):
@@ -60,7 +61,9 @@ any more — see "Providers history".)
    (`DEEPMINE_CONCURRENCY`, default 20; `maxResults` 100 people each).
 3. **Per row:** pick up to 5 people whose **job title** matches the target roles; insert
    into `alternate_leads` (`email` NULL); set the row's flags (below).
-4. **Flush:** append every queued `alternate_leads` row to the sheet, email Liv a preview.
+4. **Notify:** email Liv a preview (up to 100 rows) of ONLY the `alternate_leads` ids inserted
+   this run (`notifyNewLeads`); no email if nothing was inserted. No sheet writes.
+   `is_added_to_sheet` is no longer maintained (new rows stay `false`).
 
 - **Target roles** (word-boundary regexes on the job TITLE only — `TARGET_ROLE_PATTERNS`):
   Conference/Events Manager, Marketing Manager, Communication Manager, Learning &
@@ -95,8 +98,11 @@ any more — see "Providers history".)
   null emails** before relying on this (not yet checked); (2) the queries
   `… where email not in (select email from alternate_leads)` return ZERO rows once any
   email is NULL (`NOT IN` + NULL) — use `NOT EXISTS` or `where email is not null` in the
-  subquery; (3) `?fixorg=1` matches by email so it skips these; (4) the sheet's Email
-  column is blank for them.
+  subquery; (3) `?fixorg=1` matches by email so it skips these; (4) the sheet (no longer
+  written by the function) contains the 69 email-less leads appended before v60.
+- **`alternate_leads.sheet_remark`** (text; added 2026-11-18): ONE-TIME copy of the sheet's
+  Remark column ("Send intro" / "5A" / null), matched by email. NOT kept in sync — the
+  function never writes it. 44 Send intro, 30 5A, 70 null.
 - **DeepMine actor facts:** input `companies[]` (names or LinkedIn URLs), `maxResults`,
   `enrichProfiles` (we pass false), `title` (a single EXACT phrase — useless: "Marketing
   Manager" returned 0). Output per person: `firstName`, `lastName`, `jobTitle`, `headline`,
@@ -106,12 +112,12 @@ any more — see "Providers history".)
   prompt asks for the common/LinkedIn trading name ("AMCA Australia"), because the legal
   name ("Air Conditioning & Mechanical Contractors' Association of Australia Limited")
   returned 0 people.
-- **Wall-clock guard (append+email must always run).** The isolate is hard-killed at
-  ~150s and the append-to-sheet + email step runs ONCE, after the searches/loop. Env knobs:
+- **Wall-clock guard (the notify step must always run).** The isolate is hard-killed at
+  ~150s and the email step runs ONCE, after the searches/loop. Env knobs:
   `WALL_CLOCK_MS` (150000), `APPEND_RESERVE_MS` (15000), `APIFY_CALL_RESERVE_MS` (75000),
   `DEEPMINE_TIMEOUT_S` (90, per-search), `DEEPMINE_CONCURRENCY` (20), `DEEPMINE_MAX_RESULTS`
-  (100), `APIFY_MAX_DOMAINS` (80, per-run cap), `APIFY_ACTOR`. Recover DB-only leads
-  (inserted but not on the sheet, `is_added_to_sheet=false`) with `?append=1`.
+  (100), `APIFY_MAX_DOMAINS` (80, per-run cap), `APIFY_ACTOR`. If the run is killed before
+  the email, the leads are still in `alternate_leads` (no resend path exists).
 - **Only mark a row processed when a real lead was inserted** (see flags above) — no row
   is burned without a lead.
 - **`closed_sequence_threads` has no `source_type_id`** (it's on the follow-up

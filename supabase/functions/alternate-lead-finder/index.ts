@@ -501,6 +501,7 @@ async function run(limit?: number, opts?: { notifyTo?: string }): Promise<Record
   let inserted = 0;
   let processed = 0;
   let stoppedEarly = false;
+  const newLeadIds: number[] = []; // alternate_leads ids inserted this run (for the email preview)
 
   // Run `fn` over `items` with at most `limit` in flight at once.
   const mapLimit = async <T>(items: T[], limit: number, fn: (item: T) => Promise<void>): Promise<void> => {
@@ -580,7 +581,7 @@ async function run(limit?: number, opts?: { notifyTo?: string }): Promise<Record
         : null;
 
       for (const c of candidates) {
-        const { error: insErr } = await db.from("alternate_leads").insert({
+        const { data: insRow, error: insErr } = await db.from("alternate_leads").insert({
           source_table: row.source_table,
           thread_id: row.thread_id,
           source_type_id: ctx.source_type_id ?? null,
@@ -593,12 +594,13 @@ async function run(limit?: number, opts?: { notifyTo?: string }): Promise<Record
           event,
           subject,
           lead_type: leadType,
-          is_added_to_sheet: false,
-        });
+          is_added_to_sheet: false, // sheet append is disabled; column left at its default
+        }).select("id").single();
         if (insErr) {
           console.warn(`Insert failed for ${c.first_name} ${c.last_name}: ${insErr.message}`);
           continue;
         }
+        if (insRow?.id != null) newLeadIds.push(insRow.id as number);
         const k = nameKey(c);
         knownPeople.add(`${k}|${domain}`);
         if (org) knownPeople.add(`${k}|${normOrg(org)}`);
@@ -632,9 +634,9 @@ async function run(limit?: number, opts?: { notifyTo?: string }): Promise<Record
 
   console.log(`Inserted ${inserted} alternate lead(s) across ${domainCache.size} domain(s).${stoppedEarly ? " (stopped early on wall-clock budget - remaining rows retry next run)" : ""}`);
 
-  // 5. Append newly found leads to the sales sheet, then email Liv a preview
+  // 5. Email Liv a preview of the leads inserted this run (NO sheet append any more).
   //    (?to= redirects the notification during testing so Liv isn't emailed).
-  const sheetResult = await appendToSheetAndNotify(db, opts?.notifyTo);
+  const sheetResult = await notifyNewLeads(db, newLeadIds, opts?.notifyTo);
 
   return {
     rows: rows.length, processed, inserted, domains: domainCache.size, stoppedEarly,
@@ -679,7 +681,7 @@ function esc(s: string): string {
 }
 
 function buildEmailHtml(leads: AltRow[]): string {
-  const previewRows = leads.slice(0, 20).map((r) => {
+  const previewRows = leads.slice(0, 100).map((r) => {
     const name = [r.poc_firstname, r.poc_lastname].filter(Boolean).join(" ") || "—";
     const ctx = r.lead_type === "soc med" && (r.event || r.speaker)
       ? `${esc(r.event ?? "")}${r.speaker ? " · " + esc(r.speaker) : ""}` : "";
@@ -692,7 +694,7 @@ function buildEmailHtml(leads: AltRow[]): string {
       <td style="padding:6px 10px;border-bottom:1px solid #eee">${ctx || "—"}</td>
     </tr>`;
   }).join("");
-  const more = leads.length > 20 ? `<p style="color:#666;font-size:13px">…and ${leads.length - 20} more in the sheet.</p>` : "";
+  const more = leads.length > 100 ? `<p style="color:#666;font-size:13px">…and ${leads.length - 100} more in the alternate_leads table.</p>` : "";
   return `<div style="font-family:Arial,Helvetica,sans-serif;color:#222;max-width:760px">
     <p>Hi Liv,</p>
     <p><strong>${leads.length} new alternate lead${leads.length === 1 ? "" : "s"}</strong> ${leads.length === 1 ? "is" : "are"} ready for your review.</p>
@@ -707,46 +709,25 @@ function buildEmailHtml(leads: AltRow[]): string {
       <tbody>${previewRows}</tbody>
     </table>
     ${more}
-    <p style="margin:18px 0">
-      <a href="${SHEET_URL}" style="background:#1a73e8;color:#fff;text-decoration:none;padding:10px 18px;border-radius:6px;display:inline-block">
-        Open the sheet for review →</a>
-    </p>
-    <p style="color:#888;font-size:12px">Automated by the Alternate Lead Finder · tab: ${esc(SHEET_TAB)}</p>
+    <p style="color:#888;font-size:12px">Automated by the Alternate Lead Finder. Leads are stored in the alternate_leads table.</p>
   </div>`;
 }
 
-async function appendToSheetAndNotify(db: SupabaseClient, toOverride?: string): Promise<Record<string, unknown>> {
-  const result: Record<string, unknown> = { appended: 0, emailed: false };
+// The function NO LONGER appends to the Google Sheet (the sheet helpers above are kept
+// for ?inspect / ?fixorg only). It just emails a preview of the leads inserted THIS run.
+async function notifyNewLeads(db: SupabaseClient, ids: number[], toOverride?: string): Promise<Record<string, unknown>> {
+  const result: Record<string, unknown> = { emailed: false };
   const recipient = toOverride || NOTIFY_TO;
+  if (ids.length === 0) { console.log("No new leads - no email sent."); return result; }
 
-  // Rows queued for the sheet (this run's inserts + any prior unadded).
   const { data: pending, error } = await db
     .from("alternate_leads")
     .select("id, created_at, lead_type, org, poc_firstname, poc_lastname, poc_role, email, speaker, event, subject, source_table, thread_id")
-    .or("is_added_to_sheet.is.null,is_added_to_sheet.eq.false")
+    .in("id", ids)
     .order("id", { ascending: true });
-  if (error) { result.sheetError = error.message; return result; }
+  if (error) { result.notifyError = error.message; return result; }
   const leads = (pending ?? []) as AltRow[];
-  if (leads.length === 0) { console.log("No new leads to append."); return result; }
-
-  // --- Append to Google Sheet ---
-  try {
-    const token = await getGoogleAccessToken("https://www.googleapis.com/auth/spreadsheets");
-    await sheetsEnsureTabWithHeader(token, SHEET_HEADER);
-    const header = await sheetsGetRow1(token);
-    const rows = leads.map((r) => header.map((h) => valueForHeader(h, r)));
-    await sheetsAppend(token, rows);
-
-    const ids = leads.map((r) => r.id);
-    const { error: updErr } = await db.from("alternate_leads").update({ is_added_to_sheet: true }).in("id", ids);
-    if (updErr) console.warn(`Failed to flag is_added_to_sheet: ${updErr.message}`);
-    result.appended = leads.length;
-    console.log(`Appended ${leads.length} lead(s) to ${SHEET_TAB}.`);
-  } catch (err) {
-    console.error(`Sheet append failed (leads left queued): ${err}`);
-    result.sheetError = String(err);
-    return result; // don't email if the sheet write didn't happen
-  }
+  if (leads.length === 0) return result;
 
   // --- Email Liv a preview ---
   try {
@@ -918,16 +899,10 @@ Deno.serve(async (req: Request) => {
   const limitParam = params.get("limit");
   const limit = limitParam ? parseInt(limitParam, 10) : undefined;
 
-  // Debug: ?append=1 runs ONLY the sheet-append + email step against already
-  // queued alternate_leads (is_added_to_sheet false/null). No Hunter calls.
+  // ?append=1 used to run the sheet-append + email step. The sheet append was removed,
+  // so it is now a no-op that says so (nothing is written or sent).
   if (params.get("append") === "1") {
-    try {
-      const db = createClient(SUPABASE_URL, SERVICE_ROLE_KEY, { auth: { persistSession: false } });
-      const res = await appendToSheetAndNotify(db, params.get("to") ?? undefined);
-      return Response.json({ status: "done", ...res });
-    } catch (err) {
-      return Response.json({ status: "error", error: String(err) }, { status: 500 });
-    }
+    return Response.json({ status: "disabled", note: "The function no longer appends to the sheet." });
   }
 
   // Maintenance: ?fixorg=1 syncs the sheet's Org column to the DB (fills blanks /

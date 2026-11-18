@@ -1,6 +1,6 @@
 ================================================================================
 AS-BUILT — Alternate Lead Finder
-Last updated: 2026-11-18
+Last updated: 2026-11-18 (v60: sheet append removed)
 ================================================================================
 
 OVERVIEW
@@ -8,7 +8,8 @@ Weekly automation that, for each closed/unresponsive lead in
 closed_sequence_threads, finds DIFFERENT people at the same company who hold one of
 the target POC roles (names + job titles only — NO emails — via the Apify actor
 deepmine~linkedin-company-employees), records them in alternate_leads (email NULL),
-appends them to the sales Google Sheet, and emails Liv a preview.
+and emails Liv a preview of the leads found that run. It NO LONGER appends to the Google
+Sheet (removed in edge function v60).
 Hunter.io, the older Apify email-finder actor and Lusha are NOT used any more.
 
 SUPABASE PROJECTS (org zakkhdjcwkgxjppsjnyi)
@@ -20,7 +21,7 @@ SUPABASE PROJECTS (org zakkhdjcwkgxjppsjnyi)
 EDGE FUNCTION
 - supabase/functions/alternate-lead-finder/index.ts — Deno + @supabase/supabase-js
   (service role), verify_jwt=false. Deployed to project aivitcomiywiysrfwqxt
-  (currently version 59). URL:
+  (currently version 60). URL:
   https://aivitcomiywiysrfwqxt.supabase.co/functions/v1/alternate-lead-finder
   Flow:
   1. Queue: up to 20 rows (MAX_ROWS_PER_RUN, hard cap; ?limit=N can only lower it) from
@@ -46,15 +47,14 @@ EDGE FUNCTION
      target-role people at all, all other unprocessed rows for the same email domain are
      also flagged true (markCompanyFailed). Provider error / no token / cap / wall-clock
      skip -> flag stays null and the row retries.
-  5. Flush: append all is_added_to_sheet=false/null leads to the sheet tab
-     'alternate_leads_found' (dynamic column mapping), set is_added_to_sheet=true, email a
-     dynamic HTML preview to Liv (a lead with no email shows "—").
+  5. Notify: email a dynamic HTML preview (up to 100 rows) to Liv of ONLY the leads inserted
+     this run (notifyNewLeads; a lead with no email shows "—"; no email if none inserted).
+     No sheet writes; is_added_to_sheet is no longer maintained (new rows stay false).
   Runs work in EdgeRuntime.waitUntil, returns 202.
   WALL-CLOCK GUARD: isolate is hard-killed at ~150s; searches only start while
   elapsed < WALL_CLOCK_MS - APPEND_RESERVE_MS - APIFY_CALL_RESERVE_MS; skipped ones retry.
-  Recover DB-only leads (is_added_to_sheet=false) with ?append=1.
   Debug query params: ?sync=1 (await + return summary), ?limit=N, ?inspect=1 (check
-  Sheets/Gmail/AC access, no send), ?append=1 (append+email only), ?probe=<company or
+  Sheets/Gmail/AC access, no send), ?append=1 (DISABLED no-op), ?probe=<company or
   domain> (alias ?aprobe=; raw DeepMine search, no writes — shows people returned, target
   matches, picker output), ?orgprobe=<domain> (OpenAI org resolver, optional &hint=),
   ?fixorg=1 (sync sheet Org column to DB by email; skips email-less leads),
@@ -79,7 +79,8 @@ EXTERNAL INTEGRATIONS
 - OpenAI (api.openai.com/v1/responses, web_search tool) — REST, key in Supabase secret
   OPENAI_API_KEY and GCP Secret Manager (OPENAI_API_KEY). Org resolver: company's common
   trading name from its domain (e.g. amca.com.au -> "AMCA Australia").
-- Google Sheets + Gmail — Sheets/Gmail REST APIs via service account
+- Google Sheets + Gmail — (the function now only SENDS Gmail; Sheets is used only by the
+  ?inspect / ?fixorg debug paths) Sheets/Gmail REST APIs via service account
   insta-drive-uploader@claudegwscli-502400.iam.gserviceaccount.com (client id
   112006793372164249856), key in Supabase secret GOOGLE_SERVICE_ACCOUNT_JSON.
   Setup: the sales sheet is shared with the SA as Editor; the SA client id has
@@ -98,8 +99,10 @@ EXTERNAL INTEGRATIONS
 DATA STORES (project aivitcomiywiysrfwqxt)
 - alternate_leads — master record of alternate leads found. Columns = union of
   closed_sequence_threads + follow_up_sequence_threads (deduped) plus lead_type,
-  org, event, poc_lastname, poc_role, is_added_to_sheet. email is NULLABLE and is NULL for
-  DeepMine leads. Own bigserial PK, RLS on.
+  org, event, poc_lastname, poc_role, is_added_to_sheet (no longer maintained), and
+  sheet_remark (text, added 2026-11-18: ONE-TIME copy of the sheet's Remark column —
+  "Send intro" 44 / "5A" 30 / null 70 — matched by email; not kept in sync).
+  email is NULLABLE and is NULL for DeepMine leads. Own bigserial PK, RLS on. 144 rows.
 - closed_sequence_threads — input; source_table in {cold_leads_follow_up_sequence_
   threads, follow_up_sequence_threads, bounced}. Flags: is_processed (true once a lead was
   inserted) and failed_apify_search boolean (added 2026-11-18: true = search ran, no
