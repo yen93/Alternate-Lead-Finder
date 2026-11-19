@@ -1,0 +1,75 @@
+================================================================================
+CHAT HISTORY EXPORT — 2026-11-19
+Session: Built the new `alternate-lead-enrichment` edge function (Hunter main, Lusha
+backup) from prompts/191126_enrichment.txt, added the LUSHA_API_KEY secret, deployed it,
+smoke-tested it with ?dry=1 (no provider calls) and scheduled it at 2 PM PHT Mon-Fri.
+================================================================================
+
+NOTE ON REDACTIONS: Tool output this session echoed live credentials from the
+pg_cron `cron.job` table (a service-role JWT, an `sb_secret_...` key and several
+`?token=` capability tokens embedded in other jobs' commands) and the project's anon JWT
+appeared in a curl command and the cron command I created. All were replaced with
+[REDACTED_SUPABASE_JWT], [REDACTED_SUPABASE_SECRET_KEY] or [REDACTED_FUNCTION_TOKEN] and
+are NOT reproduced here. Local secret files (Supabase management token, Lusha key) were
+read through shell variables and never printed.
+NOTE: other cron jobs in project aivitcomiywiysrfwqxt embed live keys directly in their
+cron.job commands - worth rotating/moving to Vault at some point.
+
+--------------------------------------------------------------------------------
+USER:
+(/login ran.) Pointed at prompts/191126_enrichment.txt. Its content: to_process_leads =
+`select * from alternate_leads where status='Send intro' and is_processed is null and
+email is null`; enrich_tools = hunter_io_api_key.txt (main) and lusha_api_key.txt
+(backup); critical note: do NOT test so the enrich-tool creds are not used until the live
+run. Main task: create an enrichment edge function for each lead in to_process_leads, run
+at 2 PM Mon-Fri PH time, Hunter main / Lusha backup, update alternate_leads.email and
+alternate_leads.phone_number (email is priority; skip phone if it costs extra, but save
+it if found in the same run).
+
+--------------------------------------------------------------------------------
+ASSISTANT:
+Read the prompt, the existing alternate-lead-finder/index.ts, and the alternate_leads
+schema (phone_number column already exists). Found that the prompt's queue matches 0
+rows: `status` is NULL on all 143 rows; sheet_remark holds 'Send intro' (44 rows) but
+those all already have emails and are processed; the 69 genuinely email-less rows are
+unprocessed with no status. Asked the user which queue to use.
+
+--------------------------------------------------------------------------------
+USER:
+Chose "status = 'Send intro' (as written)". Then, mid-turn: "it's null for cos it will
+only have returned rows once liv approves the leads. just keep the query as is" —
+i.e. the empty result is expected; keep the query exactly.
+
+--------------------------------------------------------------------------------
+ASSISTANT:
+Acknowledged and kept the query verbatim. Listed Supabase function secrets (HUNTER_IO_API_KEY
+exists, LUSHA_API_KEY did not). Verified all 143 alternate_leads resolve to a company
+domain via thread_id -> closed_sequence_threads.email. Searched docs, then used two
+web-fetch subagents (no credentials involved) to get the exact contracts:
+- Hunter GET /v2/email-finder (X-API-KEY header; domain|company + first/last name) ->
+  data.email, data.score, data.phone_number in one response (phone is free); errors as
+  {errors:[{id,code,details}]}.
+- Lusha V3 POST /v3/contacts/search-and-enrich (api_key header) with
+  contacts[{clientReferenceId,firstName,lastName,companyName,companyDomain}] and
+  reveal:["emails"] -> results[].emails[].email / phones[].number; phone reveal is billed
+  per field, so request emails only; errors 401/402/403, per-record error.code NOT_FOUND.
+Wrote supabase/functions/alternate-lead-enrichment/index.ts: queue exactly as specified,
+ENRICH_MAX_PER_RUN cap (default 10), Hunter then Lusha, freemail-domain handling
+(search by company name), outcomes (found -> save email/phone + is_processed=true; both
+say nothing -> is_processed=true one-shot; provider error/quota -> left unprocessed to
+retry; no name -> skipped), systemic 401/403/429 disables that provider for the run,
+?dry=1 (zero provider calls), ?sync=1, ?limit=N. Type-checked (only expected Deno/esm
+errors). Confirmed secret files exist, POSTed LUSHA_API_KEY to Supabase secrets (HTTP
+201, confirmed present), deployed via the Management API multipart endpoint (v1 ACTIVE,
+verify_jwt=false), ran `?dry=1` -> {status:done, queue:0, dry:true} with no Hunter/Lusha
+calls, and created pg_cron job 45 `alternate-lead-enrichment-weekday` at '0 6 * * 1-5'
+UTC (= 2 PM PHT Mon-Fri) mirroring jobid 3's net.http_post shape with the anon key
+[REDACTED_SUPABASE_JWT]. Verified the job row and that all secret files are gitignored.
+Flagged: Hunter free plan ~50 searches/month vs a cap of 10/weekday run; Hunter key
+returned 401 on 2026-11-15 so confirm it before the first real batch; use ?dry=1 first
+once Liv approves leads. Nothing committed. Offered to document in CLAUDE.md; user then
+ran /dcp.
+
+================================================================================
+END OF EXPORT
+================================================================================

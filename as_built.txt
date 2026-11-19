@@ -1,6 +1,6 @@
 ================================================================================
 AS-BUILT — Alternate Lead Finder
-Last updated: 2026-11-18 (v60: sheet append removed)
+Last updated: 2026-11-19 (added alternate-lead-enrichment function + weekday cron)
 ================================================================================
 
 OVERVIEW
@@ -10,7 +10,9 @@ the target POC roles (names + job titles only — NO emails — via the Apify ac
 deepmine~linkedin-company-employees), records them in alternate_leads (email NULL),
 and emails Liv a preview of the leads found that run. It NO LONGER appends to the Google
 Sheet (removed in edge function v60).
-Hunter.io, the older Apify email-finder actor and Lusha are NOT used any more.
+Hunter.io, the older Apify email-finder actor and Lusha are NOT used by the finder any
+more — but a SEPARATE function, alternate-lead-enrichment (below), uses Hunter (main) and
+Lusha (backup) to find emails/phones for leads Liv has approved.
 
 SUPABASE PROJECTS (org zakkhdjcwkgxjppsjnyi)
 - aivitcomiywiysrfwqxt (MAGTestProject, ap-northeast-1) — all business tables,
@@ -69,6 +71,32 @@ EDGE FUNCTION
   (90), DEEPMINE_CONCURRENCY (20), APIFY_MAX_DOMAINS (80), OPENAI_MODEL (default gpt-4o),
   WALL_CLOCK_MS (150000), APPEND_RESERVE_MS (15000), APIFY_CALL_RESERVE_MS (75000).
 
+- supabase/functions/alternate-lead-enrichment/index.ts — Deno, service role,
+  verify_jwt=false. Deployed to aivitcomiywiysrfwqxt (version 1, 2026-11-19). URL:
+  https://aivitcomiywiysrfwqxt.supabase.co/functions/v1/alternate-lead-enrichment
+  Spec: prompts/191126_enrichment.txt. Flow:
+  1. Queue (kept EXACTLY as specified): alternate_leads where status = 'Send intro' AND
+     is_processed IS NULL AND email IS NULL, oldest id first, capped at
+     ENRICH_MAX_PER_RUN (10; ?limit=N can only lower it). `status` is populated when Liv
+     approves a lead, so the queue is EMPTY until then (by design; status is NULL on all
+     143 rows today).
+  2. Per lead: company domain via thread_id -> closed_sequence_threads.email (freemail
+     domains are ignored and the org NAME is used instead). Hunter GET /v2/email-finder
+     first (returns email + score + phone_number in one response, so phone is free); if no
+     email, Lusha V3 POST /v3/contacts/search-and-enrich with reveal:["emails"] (phone is a
+     separately billed field, so it is not requested).
+  3. Writes: email found -> alternate_leads.email (+ phone_number if returned free) and
+     is_processed=true. Both providers answered "nothing" -> is_processed=true (one-shot;
+     set null to retry). A provider error/quota (Hunter 401/403/429, Lusha 401/402/403
+     disables that provider for the run) -> is_processed stays null, retries next run. No
+     first/last name -> skipped, no call.
+  Debug params: ?dry=1 (lists the leads + resolved domain/company, ZERO provider calls),
+  ?sync=1 (await + return summary), ?limit=N. Not yet exercised with live provider creds
+  (deliberate: no testing until the first live run).
+  Requires (Supabase function secrets): HUNTER_IO_API_KEY, LUSHA_API_KEY (added
+  2026-11-19). Optional: ENRICH_MAX_PER_RUN (10), HUNTER_MIN_SCORE (0),
+  WALL_CLOCK_MS (150000), WALL_CLOCK_RESERVE_MS (8000), PROVIDER_TIMEOUT_MS (20000).
+
 EXTERNAL INTEGRATIONS
 - Apify (api.apify.com run-sync-get-dataset-items) — REST, token in Supabase secret
   APIFY_API_TOKEN and GCP Secret Manager (apify-api-token); local file
@@ -91,10 +119,14 @@ EXTERNAL INTEGRATIONS
   n8n_google_cloud_run_deployment/schedule_webhooks.sql) — populates
   closed_sequence_threads weekly via the SQL function process_unresponsive_lead(thread_id)
   (built separately).
-- Hunter.io — NO LONGER USED (key returned 401 on 2026-11-15; removed from the function).
-- Lusha — NOT USED. Key works on the V3 API only (V2 returns 410; V2 sunset 2026-11-30);
-  free plan 44 credits; tested once, not wired in. Key in lusha_api_key.txt (gitignored),
-  not stored in GCP Secret Manager.
+- Hunter.io (api.hunter.io/v2/email-finder, X-API-KEY header) — MAIN provider of the
+  alternate-lead-enrichment function only. FREE plan ~50 searches/month. The key returned
+  401 on 2026-11-15 — confirm it is valid before the first live run. Key in Supabase
+  secret HUNTER_IO_API_KEY, local hunter_io_api_key.txt (gitignored).
+- Lusha (api.lusha.com/v3, api_key header) — BACKUP provider of alternate-lead-enrichment
+  (email only). V3 API only (V2 sunset 2026-11-30); free plan 44 credits. Key in Supabase
+  secret LUSHA_API_KEY and local lusha_api_key.txt (gitignored); not in GCP Secret Manager.
+  The finder function does not use either provider.
 
 DATA STORES (project aivitcomiywiysrfwqxt)
 - alternate_leads — master record of alternate leads found. Columns = union of
@@ -118,6 +150,10 @@ AUTOMATIONS / ROUTINES (pg_cron; UTC-only, Sun UTC = Mon PHT)
   Mon 6:55 AM PHT. net.http_post to the edge function URL with the anon key.
 - n8n-closed-threads-processing (project uwsncuowtzydylfabikj, jobid 33) — '0 22 * * 0' =
   Mon 6:00 AM PHT. net.http_get to the n8n webhook.
+- alternate-lead-enrichment-weekday (project aivitcomiywiysrfwqxt, jobid 45, created
+  2026-11-19) — '0 6 * * 1-5' = 2:00 PM PHT Mon-Fri. net.http_post to the enrichment
+  function with the anon key; returns 202 and does nothing until leads have
+  status='Send intro'.
 
 OPEN ITEMS / KNOWN RISKS
 - Verify the n8n batch-mailer-...-alternate-... workflows skip alternate_leads rows with
@@ -133,6 +169,7 @@ LOCAL FILES
   (contains the public anon key only).
 - alternate-lead-finder.html — iMAG-themed end-user guide (out of date).
 - initial_prompt.txt — the original brief.
+- prompts/191126_enrichment.txt — brief for the alternate-lead-enrichment function.
 - hunter_io_api_key.txt, supabase_access_token.txt, apify_api_token.txt,
   lusha_api_key.txt — LIVE SECRETS, gitignored (never committed). The first three are
   also in GCP Secret Manager.
