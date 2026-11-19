@@ -50,28 +50,17 @@ any more — see "Providers history".)
   --module esnext --moduleResolution bundler --strict <file>` (ignore TS2304/2307/2580/
   2584/7006 — they're missing Deno/esm types).
 
-## The enrichment function (second function, added 2026-11-19)
-- Source: `supabase/functions/alternate-lead-enrichment/index.ts`; brief in
-  `prompts/191126_enrichment.txt`. Cron `alternate-lead-enrichment-weekday` (jobid 3-style,
-  jobid 45) `0 6 * * 1-5` UTC = 2 PM PHT Mon-Fri. Deploy with the same Management API
-  multipart command as above, swapping the slug/path to `alternate-lead-enrichment`.
-- Finds email (+ phone when free) for `alternate_leads` where `status = 'Send intro' AND
-  is_processed IS NULL AND email IS NULL`. **The query is deliberately exact and `status`
-  is NULL until Liv approves leads, so it returns 0 rows until then — that is expected,
-  not a bug; do NOT "fix" it** (user confirmed). Do not use `sheet_remark` instead.
-- Hunter `GET /v2/email-finder` (main; returns `phone_number` free in the same call) ->
-  Lusha V3 `POST /v3/contacts/search-and-enrich` with `reveal:["emails"]` (backup; phone is
-  a separately billed field, so skipped). Domain comes from thread_id ->
-  closed_sequence_threads.email; freemail domains fall back to the org name.
-- **Do not test it with live provider calls** (user's critical note — creds are saved for
-  the first live run). Use `?dry=1` (zero provider calls) to check the queue; `?sync=1`
-  and `?limit=N` also exist. Both secrets: `HUNTER_IO_API_KEY`, `LUSHA_API_KEY`.
-- One-shot: "nothing found" from both providers still sets `is_processed=true` (reset to
-  null to retry); provider errors/quota leave it null. Hunter free plan is ~50 searches/mo
-  and its key returned 401 on 2026-11-15 — verify before the first batch;
-  `ENRICH_MAX_PER_RUN` (default 10) caps credit burn.
-- Gotcha: other pg_cron jobs in project aivitcomiywiysrfwqxt embed live keys in their
-  `cron.job.command` text — don't print `cron.job` rows into chat/exports.
+## Lead enrichment (moved out — see `../mag_enrichment`)
+Finding emails/phones for approved `alternate_leads` is handled by the SHARED
+**contact-enrichment** service, which now lives in its own project folder
+`C:\Users\Cloverly\claude_code\mag_enrichment` (function `contact-enrichment`, table
+`public.contact_enrichment`, cron `contact-enrichment-weekday` jobid 46). It still runs in
+THIS Supabase project (`aivitcomiywiysrfwqxt`) and writes back to `alternate_leads`
+(`email`, `phone_number`, `is_processed`) for rows with `status = 'Send intro'`. The old
+`alternate-lead-enrichment` function was replaced by it and deleted. For anything about
+enrichment, see `../mag_enrichment/CLAUDE.md`.
+Gotcha (applies to this whole Supabase project): several pg_cron jobs embed live keys in
+their `cron.job.command` text — don't print `cron.job` rows into chat/exports.
 
 ## How a run works
 1. **Queue:** up to **20 rows** (`MAX_ROWS_PER_RUN`, hard cap) from `closed_sequence_threads`
